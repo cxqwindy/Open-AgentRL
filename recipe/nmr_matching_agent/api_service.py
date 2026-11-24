@@ -21,12 +21,12 @@ from recipe.nmr_matching_agent.prompt import build_system_prompt
 from recipe.nmr_matching_agent.standalone_infer_matching import (
     ANSWER_RE,
     build_template_transcript,
-    build_user_case,
     generate_once,
     load_model_and_tokenizer,
     load_tools,
     run_agent,
 )
+from recipe.nmr_matching_agent.task_input import normalize_task_input
 
 THINK_RE = re.compile(r"<think>\s*([\s\S]*?)\s*</think>", re.I)
 DEFAULT_MODEL = "/fs_mol/cxq/Xmaster_AgentRL/repair_sft/LLaMA-Factory/saves/qwen3-32b-nmr-matching-tool/full-v6_4/checkpoint-63"
@@ -190,7 +190,7 @@ class ServiceState:
     def infer(self, payload: MatchRequest) -> MatchResponse:
         if not self.ready:
             raise RuntimeError("service is not ready")
-        case = build_user_case(payload.model_dump())
+        case = normalize_task_input(payload.model_dump())
         with self.lock:  # one 32B generation stream at a time on an 80G card
             router = RuleBasedRouter(
                 case,

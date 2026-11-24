@@ -35,9 +35,14 @@ from recipe.nmr_matching_agent.nmr_matching_runtime import NmrMatchingRuntime  #
 from recipe.nmr_matching_agent.prompt import build_system_prompt  # noqa: E402
 from recipe.nmr_matching_agent.standalone_infer_matching import (  # noqa: E402
     TOOL_SCHEMAS,
-    build_user_case,
+    attach_evaluation_meta,
     parse_action,
-    parse_alpaca_input,
+    prepare_eval_record,
+)
+from recipe.nmr_matching_agent.task_input import (  # noqa: E402
+    C_PEAK_FIELDS,
+    H_PEAK_FIELDS,
+    project_peaks,
 )
 
 DEFAULT_CACHE = str(_HERE / "prediction_cache.json")
@@ -89,8 +94,8 @@ async def run_case(url: str, model: str, case: Dict[str, Any],
                    allow_remote_predict: bool = True) -> Dict[str, Any]:
     record = {
         "candidate_smiles": case["candidate_smiles"],
-        "c_nmr_peaks": case.get("c_nmr_peaks") or [],
-        "h_nmr_peaks": case.get("h_nmr_peaks") or [],
+        "c_nmr_peaks": project_peaks(case.get("c_nmr_peaks") or [], C_PEAK_FIELDS),
+        "h_nmr_peaks": project_peaks(case.get("h_nmr_peaks") or [], H_PEAK_FIELDS),
         "nmr_solvent": case.get("nmr_solvent"),
         "nmr_frequency": case.get("nmr_frequency"),
     }
@@ -198,32 +203,36 @@ def main():
     cache = json.load(open(args.cache_path))
     print(f"[cache] loaded {len(cache)} entries from {args.cache_path}")
 
-    cases: List[Dict[str, Any]] = []
+    def _prepare(rec: Dict[str, Any], index: int) -> Dict[str, Any]:
+        item = prepare_eval_record(rec, index)
+        # Historical v5 fallback: some rows stored the gold string only in output.
+        # A present _label of 0 must win; output is not copied onto the result row.
+        if "_label" not in rec and "label" not in rec and "output" in rec:
+            item["evaluation_meta"]["_label"] = rec.get("output")
+        return item
+
+    items: List[Dict[str, Any]] = []
     if args.from_test:
         data = json.load(open(args.from_test))
-        for rec in data[: args.n]:
-            case = build_user_case(parse_alpaca_input(rec["input"]))
-            case["_label"] = rec.get("_label") or rec.get("output")
-            case["_negative_type"] = rec.get("_negative_type")
-            cases.append(case)
+        items = [_prepare(rec, i) for i, rec in enumerate(data[: args.n])]
     elif args.input:
-        cases = [build_user_case(json.load(open(args.input)))]
+        items = [_prepare(json.load(open(args.input)), 0)]
     else:
-        cases = [build_case_from_flags(args)]
+        items = [_prepare(build_case_from_flags(args), 0)]
 
     results = []
-    for i, case in enumerate(cases):
+    for i, item in enumerate(items):
+        case = item["inference_input"]
         t0 = time.time()
         res = asyncio.run(run_case(args.vllm_url, args.model, case, cache,
                                     max_turns=args.max_turns,
                                     allow_remote_predict=args.allow_remote_predict))
         res["latency_s"] = round(time.time() - t0, 2)
-        res["_label"] = case.get("_label")
-        res["_negative_type"] = case.get("_negative_type")
+        res = attach_evaluation_meta(res, item)
         final = res.get("final") or {}
-        print(f"\n=== case {i+1}/{len(cases)} ===")
+        print(f"\n=== case {i+1}/{len(items)} ===")
         print(f"  candidate      : {case['candidate_smiles'][:70]}")
-        print(f"  gt / neg_type  : {case.get('_label')} / {case.get('_negative_type')}")
+        print(f"  gt / neg_type  : {res.get('_label')} / {res.get('_negative_type')}")
         print(f"  final_answer   : {final.get('final_answer')}")
         print(f"  confidence     : {final.get('confidence')}")
         print(f"  key_evidence   : {(final.get('key_evidence') or '')[:120]}")

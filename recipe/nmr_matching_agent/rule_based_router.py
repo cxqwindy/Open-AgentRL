@@ -58,12 +58,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 _RECIPE_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _RECIPE_DIR.parents[1]
 _SPECMASTER = "/fs_mol/cxq/SpecMaster_jp/perturbation_generator"
 for _p in [str(_RECIPE_DIR), _SPECMASTER]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 
 from nmr_matching_runtime import NmrMatchingRuntime  # noqa: E402
+from recipe.nmr_matching_agent.task_input import normalize_task_input  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -298,7 +302,7 @@ class RuleBasedRouter:
         config: Optional[Dict[str, Any]] = None,
         allow_remote_predict: bool = True,
     ) -> None:
-        self.record = record
+        self.record = normalize_task_input(record)
         cfg = config if config is not None else _DEFAULT_CONFIG
         # Dual-threshold: C&H both match → lower bar; only one matches → strict bar
         self.sim_threshold_both:   float = float(cfg.get("sim_threshold_both",   0.85))
@@ -323,7 +327,7 @@ class RuleBasedRouter:
         )
         self.assignment_veto: Dict[str, Any] = cfg.get("assignment_veto", {})
         self.runtime = NmrMatchingRuntime(
-            record,
+            self.record,
             prediction_cache=prediction_cache or {},
             allow_remote_predict=allow_remote_predict,
             h_tolerance=self.h_tol,
@@ -658,9 +662,10 @@ def build_prefilled_messages(
     The model should then proceed directly to a final <answer>.
     """
     tr = router_result.tool_results
+    task = normalize_task_input(case)
     msgs: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": json.dumps(case, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
     ]
     tool_sequence: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = [
         ("count_atoms",         {"element": "C"}, tr.count_c),

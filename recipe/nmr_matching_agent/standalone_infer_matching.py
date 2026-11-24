@@ -40,6 +40,7 @@ from recipe.nmr_matching_agent.evidence_reconstruction import (  # noqa: E402
     reconstruct_model_final_turn,
 )
 from recipe.nmr_matching_agent.prompt import build_system_prompt  # noqa: E402
+from recipe.nmr_matching_agent.task_input import normalize_task_input  # noqa: E402
 
 ACTION_RE = re.compile(r"<tool_call>\s*({[\s\S]*?})\s*</tool_call>", re.IGNORECASE)
 ANSWER_RE = re.compile(r"<answer>\s*([\s\S]*?)\s*</answer>", re.IGNORECASE)
@@ -171,33 +172,8 @@ def parse_alpaca_input(input_text: str) -> Dict[str, Any]:
 
 
 def build_user_case(raw: Dict[str, Any]) -> Dict[str, Any]:
-    cand = raw.get("candidate_smiles") or raw.get("candidate")
-    if not cand:
-        raise ValueError("input must contain candidate_smiles")
-
-    # Accept pre-formatted c_nmr_peaks list-of-dicts, or flat experimental_13c_peaks list
-    c_nmr = raw.get("c_nmr_peaks")
-    if not c_nmr:
-        flat_c = raw.get("experimental_13c_peaks") or []
-        c_nmr = [{"delta (ppm)": float(v)} for v in flat_c]
-
-    # Accept pre-formatted h_nmr_peaks list-of-dicts, or flat experimental_1h_peaks list
-    h_nmr = raw.get("h_nmr_peaks")
-    if not h_nmr:
-        flat_h = raw.get("experimental_1h_peaks") or []
-        # nH per-peak is unknown; runtime will fall back to experimental_total_nH field
-        h_nmr = [{"delta": float(v), "centroid": float(v), "nH": None} for v in flat_h]
-
-    return {
-        "idx": raw.get("idx", -1),
-        "candidate_smiles": cand,
-        "c_nmr_peaks": c_nmr,
-        "h_nmr_peaks": h_nmr,
-        "nmr_solvent": raw.get("nmr_solvent") or raw.get("solvent"),
-        "nmr_frequency": raw.get("nmr_frequency") or raw.get("nmr_freq"),
-        # Pass through for runtime fallback when h_peaks carry no per-peak nH
-        "experimental_total_nH": raw.get("experimental_total_nH"),
-    }
+    """Return the canonical physical task. Evaluation metadata is not copied."""
+    return normalize_task_input(raw)
 
 
 def parse_action(text: str) -> Dict[str, Any]:
@@ -248,9 +224,10 @@ def load_tools(
 
 
 def make_messages(case: Dict[str, Any]) -> List[Dict[str, str]]:
+    task = normalize_task_input(case)
     return [
         {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": json.dumps(case, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
     ]
 
 
@@ -568,72 +545,124 @@ def parse_args():
     return ap.parse_args()
 
 
-def main():
-    args = parse_args()
-    cases: List[Dict[str, Any]] = []
-    if args.from_test:
-        data = json.load(open(args.from_test))
-        for rec in data[: args.n]:
-            case = build_user_case(parse_alpaca_input(rec["input"]))
-            case["_label"] = rec.get("_label")
-            case["_negative_type"] = rec.get("_negative_type")
-            cases.append(case)
-    elif args.input:
-        cases = [build_user_case(json.load(open(args.input)))]
+_STRUCTURED_TASK_KEYS = (
+    "candidate_smiles",
+    "candidate",
+    "c_nmr_peaks",
+    "h_nmr_peaks",
+    "experimental_13c_peaks",
+    "experimental_1h_peaks",
+)
+_SAMPLE_ID_KEYS = ("case_id", "source_id", "idx", "id")
+
+
+def _has_structured_task(rec: Dict[str, Any]) -> bool:
+    return any(rec.get(key) for key in _STRUCTURED_TASK_KEYS)
+
+
+def _source_sample_id(rec: Dict[str, Any]) -> Any:
+    for key in _SAMPLE_ID_KEYS:
+        if key in rec and rec[key] not in (None, ""):
+            return rec[key]
+    return None
+
+
+def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
+    """Split one dataset row into a model task and an external evaluation record.
+
+    ``pair_index`` is the harness identity. It stays unique when the source row
+    has no id or repeats an id, and it is not copied into the task JSON.
+    """
+    if not isinstance(rec, dict):
+        raise TypeError("evaluation record must be an object")
+    if isinstance(rec.get("input"), str) and not _has_structured_task(rec):
+        physical = parse_alpaca_input(rec["input"])
     else:
-        raise SystemExit("provide --input or --from_test")
+        physical = rec
+    meta: Dict[str, Any] = {
+        "sample_id": _source_sample_id(rec),
+        "_label": rec.get("_label", rec.get("label")),
+        "_negative_type": rec.get("_negative_type", rec.get("negative_type")),
+    }
+    if "_gt_smiles" in rec or "gt_smiles" in rec:
+        meta["_gt_smiles"] = rec["_gt_smiles"] if "_gt_smiles" in rec else rec.get("gt_smiles")
+    if "_candidate_smiles" in rec:
+        meta["_candidate_smiles"] = rec.get("_candidate_smiles")
+    if "output" in rec:
+        meta["output"] = rec.get("output")
+    if "teacher_pred" in rec:
+        meta["teacher_pred"] = rec.get("teacher_pred")
+    return {
+        "pair_id": pair_index,
+        "inference_input": normalize_task_input(physical),
+        "evaluation_meta": meta,
+    }
 
-    # --- router setup (optional) ---
-    router_cache: Optional[Dict[str, Any]] = None
-    router_cfg: Optional[Dict[str, Any]] = None
-    if args.use_router:
-        from rule_based_router import RuleBasedRouter, load_config, load_prediction_cache
-        router_cfg = load_config(args.router_config)
-        if args.router_sim_threshold is not None:
-            # back-compat: set both thresholds to the same value
-            router_cfg["sim_threshold_both"]   = args.router_sim_threshold
-            router_cfg["sim_threshold_strict"] = args.router_sim_threshold
-        if args.router_sim_threshold_both is not None:
-            router_cfg["sim_threshold_both"]   = args.router_sim_threshold_both
-        if args.router_sim_threshold_strict is not None:
-            router_cfg["sim_threshold_strict"] = args.router_sim_threshold_strict
-        if args.router_template_variant_seed is not None:
-            router_cfg["template_variant_seed"] = args.router_template_variant_seed
-        router_cache = load_prediction_cache()
-        th_both   = router_cfg.get("sim_threshold_both",   0.85)
-        th_strict = router_cfg.get("sim_threshold_strict", 0.92)
-        print(f"[router] enabled  sim_threshold_both={th_both}  sim_threshold_strict={th_strict}  "
-              f"h_tol={router_cfg.get('h_tolerance', 2)}  "
-              f"template_seed={router_cfg.get('template_variant_seed', 0)}  "
-              f"languages={router_cfg.get('template_languages', ['en', 'zh', 'ja'])}")
 
-    # Lazy model loading: only load if at least one case needs the model.
-    tok = model = None
+def load_from_test(path: str, n: Optional[int] = None) -> List[Dict[str, Any]]:
+    with open(path) as handle:
+        data = json.load(handle)
+    if n is not None:
+        data = data[:n]
+    return [prepare_eval_record(rec, index) for index, rec in enumerate(data)]
 
-    def _ensure_model():
-        nonlocal tok, model
-        if tok is None:
-            print(f"[model] loading {args.model_path} ...")
-            tok, model = load_model_and_tokenizer(args.model_path)
 
-    results = []
+def attach_evaluation_meta(result: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy gold from the harness record after inference returns.
+
+    The source ``output`` text is intentionally left off the prediction row:
+    summary scripts treat a top-level ``output`` value as a predicted answer.
+    """
+    merged = dict(result)
+    meta = item["evaluation_meta"]
+    merged["_label"] = meta.get("_label")
+    merged["_negative_type"] = meta.get("_negative_type")
+    merged["_sample_id"] = meta.get("sample_id")
+    merged["_pair_id"] = item["pair_id"]
+    if "_gt_smiles" in meta:
+        merged["_gt_smiles"] = meta.get("_gt_smiles")
+    if "_candidate_smiles" in meta:
+        merged["_candidate_smiles"] = meta.get("_candidate_smiles")
+    return merged
+
+
+def reassemble_eval_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Put sharded prediction rows back into dataset order."""
+    return sorted(results, key=lambda row: row["_pair_id"])
+
+
+def run_evaluation(
+    items: List[Dict[str, Any]],
+    *,
+    use_router: bool,
+    router_cfg: Optional[Dict[str, Any]],
+    router_cache: Optional[Dict[str, Any]],
+    max_turns: int,
+    ensure_model,
+    skip_model_evidence: bool,
+) -> List[Dict[str, Any]]:
+    """Run the CLI branch loop. Model and router receive ``inference_input`` only."""
+    Router = None
+    if use_router:
+        from recipe.nmr_matching_agent.rule_based_router import RuleBasedRouter as Router
+
+    results: List[Dict[str, Any]] = []
     n_template = 0
     n_model = 0
-    for case in cases:
-        # --- try rule-based router first ---
-        if args.use_router:
-            router = RuleBasedRouter(case, prediction_cache=router_cache, config=router_cfg)
+    for item in items:
+        case = item["inference_input"]
+        if use_router:
+            router = Router(case, prediction_cache=router_cache, config=router_cfg)
             rr = router.analyze()
             if rr.route == "template":
                 n_template += 1
                 # Both legacy flag modes remain zero-model. Always use the selected
                 # multilingual router variant so think/key_evidence stay in one language.
-                if args.router_skip_model_evidence:
+                if skip_model_evidence:
                     print("[DEBUG] Template path: using deterministic router evidence")
                 else:
                     print("[DEBUG] Template path: using selected deterministic router variant")
                 full_answer = rr.full_assistant_turn
-
                 template_transcript = build_template_transcript(rr, full_answer)
                 res: Dict[str, Any] = {
                     "case_candidate": case.get("candidate_smiles"),
@@ -661,25 +690,24 @@ def main():
                     "_assignment_veto_reasons": rr.decision.assignment_veto_reasons,
                     "_assignment_shadow_mode": rr.decision.assignment_shadow_mode,
                     "_confidence": rr.decision.confidence,
-                    "_skip_model": args.router_skip_model_evidence,
+                    "_skip_model": skip_model_evidence,
                 }
             else:
                 n_model += 1
-                _ensure_model()
-                res = asyncio.run(run_agent(tok, model, case, max_turns=args.max_turns))
+                tok, model = ensure_model()
+                res = asyncio.run(run_agent(tok, model, case, max_turns=max_turns))
                 res["_route"] = "model"
                 res["_transcript_source"] = "model"
                 res["_assignment_vetoed"] = rr.decision.assignment_vetoed
                 res["_assignment_veto_reasons"] = rr.decision.assignment_veto_reasons
                 res["_assignment_shadow_mode"] = rr.decision.assignment_shadow_mode
         else:
-            _ensure_model()
-            res = asyncio.run(run_agent(tok, model, case, max_turns=args.max_turns))
+            tok, model = ensure_model()
+            res = asyncio.run(run_agent(tok, model, case, max_turns=max_turns))
             res["_route"] = "model"
             res["_transcript_source"] = "model"
 
-        res["_label"] = case.get("_label")
-        res["_negative_type"] = case.get("_negative_type")
+        res = attach_evaluation_meta(res, item)
         results.append(res)
         answer_preview = res["answer"][:120] if res["answer"] else ""
         print(json.dumps({
@@ -691,10 +719,66 @@ def main():
             "fail_reason": res["fail_reason"],
         }, ensure_ascii=False, indent=2))
 
-    if args.use_router:
-        total = len(cases)
-        print(f"\n[router] template={n_template}/{total} ({100*n_template//total if total else 0}%)  "
+    if use_router:
+        total = len(items)
+        print(f"\n[router] template={n_template}/{total} ({100 * n_template // total if total else 0}%)  "
               f"model={n_model}/{total}")
+    return results
+
+
+def main():
+    args = parse_args()
+    if args.from_test:
+        items = load_from_test(args.from_test, args.n)
+    elif args.input:
+        with open(args.input) as handle:
+            items = [prepare_eval_record(json.load(handle), 0)]
+    else:
+        raise SystemExit("provide --input or --from_test")
+
+    # --- router setup (optional) ---
+    router_cache: Optional[Dict[str, Any]] = None
+    router_cfg: Optional[Dict[str, Any]] = None
+    if args.use_router:
+        from recipe.nmr_matching_agent.rule_based_router import load_config, load_prediction_cache
+        router_cfg = load_config(args.router_config)
+        if args.router_sim_threshold is not None:
+            # back-compat: set both thresholds to the same value
+            router_cfg["sim_threshold_both"] = args.router_sim_threshold
+            router_cfg["sim_threshold_strict"] = args.router_sim_threshold
+        if args.router_sim_threshold_both is not None:
+            router_cfg["sim_threshold_both"] = args.router_sim_threshold_both
+        if args.router_sim_threshold_strict is not None:
+            router_cfg["sim_threshold_strict"] = args.router_sim_threshold_strict
+        if args.router_template_variant_seed is not None:
+            router_cfg["template_variant_seed"] = args.router_template_variant_seed
+        router_cache = load_prediction_cache()
+        th_both = router_cfg.get("sim_threshold_both", 0.85)
+        th_strict = router_cfg.get("sim_threshold_strict", 0.92)
+        print(f"[router] enabled  sim_threshold_both={th_both}  sim_threshold_strict={th_strict}  "
+              f"h_tol={router_cfg.get('h_tolerance', 2)}  "
+              f"template_seed={router_cfg.get('template_variant_seed', 0)}  "
+              f"languages={router_cfg.get('template_languages', ['en', 'zh', 'ja'])}")
+
+    # Lazy model loading: only load if at least one case needs the model.
+    tok = model = None
+
+    def _ensure_model():
+        nonlocal tok, model
+        if tok is None:
+            print(f"[model] loading {args.model_path} ...")
+            tok, model = load_model_and_tokenizer(args.model_path)
+        return tok, model
+
+    results = run_evaluation(
+        items,
+        use_router=args.use_router,
+        router_cfg=router_cfg,
+        router_cache=router_cache,
+        max_turns=args.max_turns,
+        ensure_model=_ensure_model,
+        skip_model_evidence=args.router_skip_model_evidence,
+    )
 
     Path(args.output).write_text(json.dumps(results, ensure_ascii=False, indent=2))
     print(f"[write] {args.output}")
