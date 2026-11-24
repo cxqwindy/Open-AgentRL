@@ -1,0 +1,98 @@
+# Tool config for the NMR spectrum<->SMILES MATCHING agent.
+#
+# All tool entries share one NmrMatchingSessionManager singleton (via the global manager in
+# verl.tools.nmr_matching_tools), so config keys must be kept consistent across entries. The
+# candidate SMILES + experimental peaks come from the user JSON in raw_prompt (see
+# NmrMatchingTool.create); tool args are minimal.
+#
+# Set prediction_cache_path on EVERY entry (they share the singleton, but the first-constructed
+# entry wins, so keep them identical). allow_remote_predict MUST stay false for RL rollout so a
+# cache miss cannot trigger a network call on a rollout worker.
+
+tools:
+  # --------------------- count_atoms ---------------------
+  - class_name: "verl.tools.nmr_matching_tools.NmrMatchingTool"
+    config: &matching_cfg
+      type: native
+      prediction_cache_path: "/fs_mol/cxq/Xmaster_AgentRL/Open-AgentRL/recipe/nmr_matching_agent/prediction_cache.json"
+      allow_remote_predict: false
+      sigma_c: 5.0
+      sigma_h: 0.3
+    tool_schema:
+      type: "function"
+      function:
+        name: "count_atoms"
+        description: "Count carbon or hydrogen atoms in the candidate molecule (exact, via RDKit) and compare against the experimental NMR signal count. Use element='C' to compare candidate carbons vs the number of 13C signals, or element='H' to compare candidate hydrogens vs the summed 1H integrations."
+        parameters:
+          type: "object"
+          properties:
+            element:
+              type: "string"
+              description: "Which atom to count: 'C' (carbon) or 'H' (hydrogen)."
+              enum: ["C", "H"]
+          required: ["element"]
+
+  # --------------------- spectral_match ---------------------
+  - class_name: "verl.tools.nmr_matching_tools.NmrMatchingTool"
+    config: *matching_cfg
+    tool_schema:
+      type: "function"
+      function:
+        name: "spectral_match"
+        description: "Forward-predict the candidate's NMR spectrum and score its similarity (0..1, higher=better) against the experimental spectrum. Returns overall similarity plus per-nucleus (13C/1H) sub-scores and peak counts. Use this to judge whether the candidate's structure is consistent with the observed shifts -- especially for same-formula isomers where atom counting is uninformative."
+        parameters:
+          type: "object"
+          properties:
+            sigma_c:
+              type: "number"
+              description: "Optional 13C Gaussian match width in ppm (default 5.0)."
+            sigma_h:
+              type: "number"
+              description: "Optional 1H Gaussian match width in ppm (default 0.3)."
+          required: []
+
+  # --------------------- check_substructure ---------------------
+  - class_name: "verl.tools.nmr_matching_tools.NmrMatchingTool"
+    config: *matching_cfg
+    tool_schema:
+      type: "function"
+      function:
+        name: "check_substructure"
+        description: "Check whether a functional group / substructure is present in the candidate (exact RDKit SMARTS match). Pass a group NAME (e.g. 'ester','methoxy','ethoxy','amide','carbonyl','hydroxyl','nitrile','tms','aromatic_ring','furan','pyridine') or a raw SMARTS string. Use this to confirm/deny a group the spectrum implies -- e.g. a 9H singlet near 0 ppm implies TMS."
+        parameters:
+          type: "object"
+          properties:
+            pattern:
+              type: "string"
+              description: "A functional-group name (see description) or a raw SMARTS pattern."
+          required: ["pattern"]
+
+  # --------------------- functional_group_scan ---------------------
+  - class_name: "verl.tools.nmr_matching_tools.NmrMatchingTool"
+    config: *matching_cfg
+    tool_schema:
+      type: "function"
+      function:
+        name: "functional_group_scan"
+        description: "Scan the candidate for all known functional groups at once and return the list present. Use as a broad first pass when you are unsure which specific group to check."
+        parameters:
+          type: "object"
+          properties: {}
+          required: []
+
+  # --------------------- peak_assignment ---------------------
+  - class_name: "verl.tools.nmr_matching_tools.NmrMatchingTool"
+    config: *matching_cfg
+    tool_schema:
+      type: "function"
+      function:
+        name: "peak_assignment"
+        description: "Globally assign predicted and experimental C or H signals one-to-one using Hungarian matching. Returns bidirectional unmatched peaks, residual statistics, large local contradictions, and signal/group counts."
+        parameters:
+          type: "object"
+          properties:
+            nucleus:
+              type: "string"
+              description: "Nucleus to assign: C (default) or H."
+              enum: ["C", "H"]
+          required: []

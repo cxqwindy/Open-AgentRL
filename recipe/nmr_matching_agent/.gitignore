@@ -1,0 +1,17 @@
+# Ignore rules for this recipe only.
+# JSON configs such as router_config.json stay eligible for tracking.
+
+__pycache__/
+*.py[cod]
+
+# Local datasets
+/data/
+/data_*/
+
+# Prediction caches and their backups
+/prediction_cache*
+
+# Logs and one-off run outputs
+*.log
+/*_result.json
+/results/

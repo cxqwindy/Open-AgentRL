@@ -1,0 +1,34 @@
+{
+    "_comment": "Dual-threshold strategy with symmetric C/H missing handling and deterministic multilingual template variants.",
+    "_routing_semantics": "Missing C or H may be waived with the other count pass + strict spectral threshold; available H differences up to h_tolerance pass template gating; larger count mismatches or spectral ok=false route to model.",
+    "_legacy_calibration_before_missing_symmetry_fix": {
+        "sim_threshold_both=0.85 + sim_threshold_strict=0.92": {
+            "positive_recall": "25.2% (+17.1pt vs old flat-0.92)",
+            "fp_rate": "0.83% (10 FP)",
+            "similar_structure_fp": 3
+        },
+        "old_flat_0.92": {
+            "positive_recall": "8.1%",
+            "fp_rate": "0.33% (4 FP)",
+            "similar_structure_fp": 1
+        }
+    },
+    "sim_threshold_both": 0.85,
+    "sim_threshold_strict": 0.92,
+    "h_tolerance": 2,
+    "template_variant_seed": 0,
+    "template_languages": ["en"],
+    "assignment_veto": {
+        "enabled": true,
+        "shadow_mode": true,
+        "policy_version": "hungarian-v2-shadow-2026-10",
+        "c_max_abs_ppm": 8.0,
+        "h_max_abs_ppm": 0.35,
+        "fail_closed": true
+    },
+    "confidence_weights": {
+        "sim": 0.40,
+        "c_sim": 0.30,
+        "h_sim": 0.30
+    }
+}
