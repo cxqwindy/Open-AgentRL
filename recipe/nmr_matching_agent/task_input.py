@@ -41,6 +41,11 @@ H_PEAK_FIELDS: Tuple[str, ...] = (
 _C_PEAK_FIELD_SET = frozenset(C_PEAK_FIELDS)
 _H_PEAK_FIELD_SET = frozenset(H_PEAK_FIELDS)
 
+# Harness bookkeeping. These keys are not task fields and must not be copied
+# into a model message, router record, or tool raw_prompt.
+HARNESS_PAIR_ID_KEY = "_harness_pair_id"
+HARNESS_RUN_ID_KEY = "_harness_run_id"
+
 
 def project_peaks(peaks: Iterable[Any], allowed: Iterable[str]) -> List[Any]:
     """Copy peaks, keeping only supported physical keys on dict entries.

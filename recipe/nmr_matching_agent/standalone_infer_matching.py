@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import re
 import sys
@@ -40,7 +41,14 @@ from recipe.nmr_matching_agent.evidence_reconstruction import (  # noqa: E402
     reconstruct_model_final_turn,
 )
 from recipe.nmr_matching_agent.prompt import build_system_prompt  # noqa: E402
-from recipe.nmr_matching_agent.task_input import normalize_task_input  # noqa: E402
+from recipe.nmr_matching_agent.task_input import (  # noqa: E402
+    C_PEAK_FIELDS,
+    H_PEAK_FIELDS,
+    HARNESS_PAIR_ID_KEY,
+    HARNESS_RUN_ID_KEY,
+    normalize_task_input,
+    project_peaks,
+)
 
 ACTION_RE = re.compile(r"<tool_call>\s*({[\s\S]*?})\s*</tool_call>", re.IGNORECASE)
 ANSWER_RE = re.compile(r"<answer>\s*([\s\S]*?)\s*</answer>", re.IGNORECASE)
@@ -545,19 +553,20 @@ def parse_args():
     return ap.parse_args()
 
 
-_STRUCTURED_TASK_KEYS = (
+_PHYSICAL_KEYS = (
     "candidate_smiles",
     "candidate",
     "c_nmr_peaks",
     "h_nmr_peaks",
     "experimental_13c_peaks",
     "experimental_1h_peaks",
+    "nmr_solvent",
+    "solvent",
+    "nmr_frequency",
+    "nmr_freq",
+    "experimental_total_nH",
 )
 _SAMPLE_ID_KEYS = ("case_id", "source_id", "idx", "id")
-
-
-def _has_structured_task(rec: Dict[str, Any]) -> bool:
-    return any(rec.get(key) for key in _STRUCTURED_TASK_KEYS)
 
 
 def _source_sample_id(rec: Dict[str, Any]) -> Any:
@@ -567,18 +576,142 @@ def _source_sample_id(rec: Dict[str, Any]) -> Any:
     return None
 
 
+def _present_peaks(raw: Dict[str, Any], primary: str, alias: Optional[str], nucleus: str) -> List[Any]:
+    """Return canonical peaks from one source. An empty list means 'not provided'."""
+    peaks = raw.get(primary) or None
+    if not peaks and alias:
+        peaks = raw.get(alias) or None
+    if not peaks:
+        return []
+    if not isinstance(peaks, list):
+        raise TypeError(f"{primary} must be a list when provided")
+    if not isinstance(peaks[0], dict):
+        if nucleus == "C":
+            peaks = [{"delta (ppm)": float(value)} for value in peaks]
+        else:
+            peaks = [{"delta": float(value), "centroid": float(value), "nH": None} for value in peaks]
+    fields = C_PEAK_FIELDS if nucleus == "C" else H_PEAK_FIELDS
+    return project_peaks(peaks, fields)
+
+
+def _merge_peak_lists(text_peaks: List[Any], struct_peaks: List[Any], nucleus: str) -> List[Any]:
+    """Keep whichever source has peaks. When both do, require agreement and keep the union.
+
+    Within structured fields the historical alias priority still applies before
+    this comparison: ``c_nmr_peaks`` wins over ``experimental_13c_peaks``, and
+    ``h_nmr_peaks`` wins over ``experimental_1h_peaks``.
+    """
+    if not text_peaks:
+        return struct_peaks
+    if not struct_peaks:
+        return text_peaks
+    if len(text_peaks) != len(struct_peaks):
+        raise ValueError(
+            f"{nucleus} peak count differs between text input and structured fields "
+            f"({len(text_peaks)} vs {len(struct_peaks)})"
+        )
+    merged: List[Any] = []
+    for index, (text_peak, struct_peak) in enumerate(zip(text_peaks, struct_peaks)):
+        if not isinstance(text_peak, dict) or not isinstance(struct_peak, dict):
+            if text_peak != struct_peak:
+                raise ValueError(f"{nucleus} peak {index} differs between text input and structured fields")
+            merged.append(copy.deepcopy(text_peak))
+            continue
+        for key in set(text_peak) & set(struct_peak):
+            if text_peak[key] != struct_peak[key]:
+                raise ValueError(
+                    f"{nucleus} peak {index} field {key!r} differs between text input and structured fields"
+                )
+        combined = dict(text_peak)
+        combined.update(struct_peak)
+        merged.append(combined)
+    return merged
+
+
+def _compose_inference_input(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the physical task from text and structured fields.
+
+    Rules:
+    - A non-empty ``input`` string is parsed with the existing alpaca parser.
+      Solvent, frequency, and total integration are not read from that text.
+    - Structured aliases keep their old priority. Gold keys such as ``_label``,
+      ``_gt_smiles``, and ``_candidate_smiles`` are not candidate or peak sources.
+    - A candidate or peak list supplied by only one source is kept. Supplying the
+      same candidate alongside text does not drop the text spectrum.
+    - If both sources provide a candidate or a peak list and the values disagree,
+      raise. The label is not used to choose a side.
+    - An empty spectrum is an error, not a task that can be sent to inference.
+    - With no text, the structured record is normalized exactly as before.
+    """
+    text_raw = rec.get("input")
+    text = parse_alpaca_input(text_raw) if isinstance(text_raw, str) and text_raw.strip() else None
+    structured = {key: rec[key] for key in _PHYSICAL_KEYS if key in rec}
+    if text is None:
+        task = normalize_task_input(structured)
+        if not task["c_nmr_peaks"] and not task["h_nmr_peaks"]:
+            raise ValueError("task has no experimental NMR peaks")
+        return task
+
+    text_candidate = text.get("candidate_smiles") or None
+    structured_candidate = structured.get("candidate_smiles") or structured.get("candidate") or None
+    if text_candidate and structured_candidate and text_candidate != structured_candidate:
+        raise ValueError("candidate SMILES differs between text input and structured fields")
+    candidate = structured_candidate or text_candidate
+    if not candidate:
+        raise ValueError("input must contain candidate_smiles")
+
+    c_peaks = _merge_peak_lists(
+        _present_peaks(text, "c_nmr_peaks", None, "C"),
+        _present_peaks(structured, "c_nmr_peaks", "experimental_13c_peaks", "C"),
+        "13C",
+    )
+    h_peaks = _merge_peak_lists(
+        _present_peaks(text, "h_nmr_peaks", None, "H"),
+        _present_peaks(structured, "h_nmr_peaks", "experimental_1h_peaks", "H"),
+        "1H",
+    )
+    if not c_peaks and not h_peaks:
+        raise ValueError("task has no experimental NMR peaks")
+    merged: Dict[str, Any] = {
+        "candidate_smiles": candidate,
+        "c_nmr_peaks": c_peaks,
+        "h_nmr_peaks": h_peaks,
+        "nmr_solvent": structured.get("nmr_solvent") or structured.get("solvent"),
+        "nmr_frequency": structured.get("nmr_frequency") or structured.get("nmr_freq"),
+    }
+    if "experimental_total_nH" in structured:
+        merged["experimental_total_nH"] = structured["experimental_total_nH"]
+    return normalize_task_input(merged)
+
+
+def _pair_index_for(rec: Dict[str, Any], local_index: int) -> int:
+    if HARNESS_PAIR_ID_KEY not in rec:
+        return local_index
+    value = rec[HARNESS_PAIR_ID_KEY]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"invalid {HARNESS_PAIR_ID_KEY}: {value!r}")
+    return value
+
+
+def _harness_run_id(rec: Dict[str, Any]) -> Optional[str]:
+    if HARNESS_RUN_ID_KEY not in rec:
+        return None
+    value = rec[HARNESS_RUN_ID_KEY]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"invalid {HARNESS_RUN_ID_KEY}")
+    return value
+
+
 def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
     """Split one dataset row into a model task and an external evaluation record.
 
-    ``pair_index`` is the harness identity. It stays unique when the source row
-    has no id or repeats an id, and it is not copied into the task JSON.
+    ``pair_index`` is the harness identity for this run. It is not a source
+    ``case_id``/``idx`` and it is not copied into the task JSON.
     """
     if not isinstance(rec, dict):
         raise TypeError("evaluation record must be an object")
-    if isinstance(rec.get("input"), str) and not _has_structured_task(rec):
-        physical = parse_alpaca_input(rec["input"])
-    else:
-        physical = rec
+    if isinstance(pair_index, bool) or not isinstance(pair_index, int) or pair_index < 0:
+        raise ValueError(f"invalid harness pair index: {pair_index!r}")
     meta: Dict[str, Any] = {
         "sample_id": _source_sample_id(rec),
         "_label": rec.get("_label", rec.get("label")),
@@ -592,19 +725,29 @@ def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
         meta["output"] = rec.get("output")
     if "teacher_pred" in rec:
         meta["teacher_pred"] = rec.get("teacher_pred")
+    run_id = _harness_run_id(rec)
+    if run_id is not None:
+        meta["run_id"] = run_id
     return {
         "pair_id": pair_index,
-        "inference_input": normalize_task_input(physical),
+        "run_id": run_id,
+        "inference_input": _compose_inference_input(rec),
         "evaluation_meta": meta,
     }
 
 
 def load_from_test(path: str, n: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Load a full file or one shard.
+
+    A shard written by the production splitter carries ``_harness_pair_id``.
+    That global index is reused. A file without it uses the local row number,
+    which is the global index only when the file is the full input.
+    """
     with open(path) as handle:
         data = json.load(handle)
     if n is not None:
         data = data[:n]
-    return [prepare_eval_record(rec, index) for index, rec in enumerate(data)]
+    return [prepare_eval_record(rec, _pair_index_for(rec, index)) for index, rec in enumerate(data)]
 
 
 def attach_evaluation_meta(result: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
@@ -619,6 +762,8 @@ def attach_evaluation_meta(result: Dict[str, Any], item: Dict[str, Any]) -> Dict
     merged["_negative_type"] = meta.get("_negative_type")
     merged["_sample_id"] = meta.get("sample_id")
     merged["_pair_id"] = item["pair_id"]
+    if item.get("run_id"):
+        merged[HARNESS_RUN_ID_KEY] = item["run_id"]
     if "_gt_smiles" in meta:
         merged["_gt_smiles"] = meta.get("_gt_smiles")
     if "_candidate_smiles" in meta:
@@ -627,8 +772,75 @@ def attach_evaluation_meta(result: Dict[str, Any], item: Dict[str, Any]) -> Dict
 
 
 def reassemble_eval_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Put sharded prediction rows back into dataset order."""
+    """Put prediction rows back into harness order. Duplicate ids are rejected."""
+    ids = [row["_pair_id"] for row in results]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate harness pair id")
     return sorted(results, key=lambda row: row["_pair_id"])
+
+
+def merge_eval_results(
+    parts: List[List[Dict[str, Any]]],
+    manifest: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Merge production shard outputs.
+
+    Stamped rows are checked against the split manifest, including duplicate
+    ids, missing rows, and rows from another run. Failed rows are kept.
+    Rows without harness ids can be read only when no manifest is supplied.
+    They stay in the given file order, that order is not a verified global
+    reconstruction, and no ids are invented. A manifest plus unstamped rows
+    is rejected instead of being treated as a successful reorder.
+    """
+    rows: List[Dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, list):
+            raise ValueError("each shard result must be a JSON list")
+        rows.extend(part)
+
+    def _stamped(row: Dict[str, Any]) -> bool:
+        return isinstance(row, dict) and "_pair_id" in row and HARNESS_RUN_ID_KEY in row
+
+    if rows and not all(isinstance(row, dict) for row in rows):
+        raise ValueError("each result row must be an object")
+    flags = [_stamped(row) for row in rows]
+    if not any(flags):
+        if manifest is not None:
+            raise ValueError(
+                "shard manifest was provided but result rows have no harness pair ids; "
+                "reorder is not verified and global ids were not invented"
+            )
+        return {"rows": rows, "mode": "legacy_input_order", "reorder_verified": False}
+    if not all(flags):
+        raise ValueError("refusing to mix harness-stamped results with unstamped results")
+    if manifest is None:
+        raise ValueError("stamped results require the shard manifest to check for missing samples")
+
+    run_ids = {row[HARNESS_RUN_ID_KEY] for row in rows}
+    if len(run_ids) != 1:
+        raise ValueError("refusing to merge results from different evaluation runs")
+    run_id = next(iter(run_ids))
+    if manifest.get("harness_run_id") != run_id:
+        raise ValueError("result run id does not match the shard manifest")
+
+    ids = [row["_pair_id"] for row in rows]
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in ids):
+        raise ValueError("harness pair id must be an integer")
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate harness pair id")
+    expected = list(manifest.get("pair_ids") or [])
+    if len(expected) != len(set(expected)):
+        raise ValueError("manifest pair ids are not unique")
+    if set(ids) != set(expected):
+        missing = sorted(set(expected) - set(ids))
+        extra = sorted(set(ids) - set(expected))
+        raise ValueError(f"result rows do not match the manifest (missing={missing}, extra={extra})")
+    return {
+        "rows": sorted(rows, key=lambda row: row["_pair_id"]),
+        "mode": "harness_pair_id",
+        "reorder_verified": True,
+        "harness_run_id": run_id,
+    }
 
 
 def run_evaluation(
