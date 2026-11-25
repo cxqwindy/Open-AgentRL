@@ -34,7 +34,8 @@ import pandas as pd
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from prompt import build_system_prompt  # noqa: E402
-from standalone_infer_matching import parse_alpaca_input  # noqa: E402
+from standalone_infer_matching import parse_alpaca_input, prepare_eval_record  # noqa: E402
+from task_input import has_experimental_signal, normalize_task_input, task_to_lossless_text  # noqa: E402
 
 DATA_SOURCE = "nmr_matching_v4_agent"
 
@@ -79,17 +80,20 @@ def _row_from_parquet_row(row) -> dict:
     user_content = last["content"] if isinstance(last, dict) else _as_dict(last)["content"]
 
     case = _alpaca_input_to_case(user_content)
+    if not case.get("candidate_smiles"):
+        raise ValueError("task candidate is missing; reward ground_truth is not a candidate source")
+    case = normalize_task_input(case)
+    if not has_experimental_signal(case):
+        raise ValueError("task has no experimental NMR peaks")
     rm = _as_dict(row["reward_model"]) or {}
     gt = _as_dict(rm.get("ground_truth")) or {}
-    if gt.get("candidate_smiles"):
-        case["candidate_smiles"] = gt["candidate_smiles"]
 
     system_prompt = build_system_prompt()
     return {
         "data_source": DATA_SOURCE,
         "prompt": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(case, ensure_ascii=False)},
+            {"role": "user", "content": task_to_lossless_text(case)},
         ],
         "ability": row.get("ability", "NMR"),
         "reward_model": {"ground_truth": gt},
@@ -98,9 +102,22 @@ def _row_from_parquet_row(row) -> dict:
 
 
 def _row_from_alpaca(idx: int, rec: dict) -> dict:
-    case = _alpaca_input_to_case(rec["input"])
-    if rec.get("_candidate_smiles"):
-        case["candidate_smiles"] = rec["_candidate_smiles"]
+    """Use the task schema. ``_gt_smiles`` is reward metadata, not the candidate.
+
+    ``_candidate_smiles`` is checked against the task candidate and never replaces it.
+    """
+    if not isinstance(rec, dict):
+        raise ValueError(f"row {idx}: record is not an object")
+    if not rec.get("input") and not rec.get("candidate_smiles") and not rec.get("candidate"):
+        raise ValueError(f"row {idx}: task candidate is missing; _gt_smiles is not a candidate source")
+    prepared = prepare_eval_record(rec, idx)
+    case = prepared["inference_input"]
+    meta_candidate = rec.get("_candidate_smiles")
+    if meta_candidate and meta_candidate != case.get("candidate_smiles"):
+        raise ValueError(
+            f"row {idx}: _candidate_smiles {meta_candidate!r} conflicts with task candidate "
+            f"{case.get('candidate_smiles')!r}"
+        )
     gt = {
         "label": rec.get("_label", 0),
         "negative_type": rec.get("_negative_type", "unknown"),
@@ -112,7 +129,7 @@ def _row_from_alpaca(idx: int, rec: dict) -> dict:
         "data_source": DATA_SOURCE,
         "prompt": [
             {"role": "system", "content": build_system_prompt()},
-            {"role": "user", "content": json.dumps(case, ensure_ascii=False)},
+            {"role": "user", "content": task_to_lossless_text(case)},
         ],
         "ability": "NMR",
         "reward_model": {"ground_truth": gt},

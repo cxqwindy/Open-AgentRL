@@ -40,9 +40,11 @@ from recipe.nmr_matching_agent.standalone_infer_matching import (  # noqa: E402
     prepare_eval_record,
 )
 from recipe.nmr_matching_agent.task_input import (  # noqa: E402
-    C_PEAK_FIELDS,
-    H_PEAK_FIELDS,
-    project_peaks,
+    has_experimental_signal,
+    normalize_task_input,
+    parse_c_peak_list,
+    parse_h_peak_list,
+    task_to_lossless_text,
 )
 
 DEFAULT_CACHE = str(_HERE / "prediction_cache.json")
@@ -88,22 +90,38 @@ async def chat_turn(client: httpx.AsyncClient, url: str, model: str,
     return text, raw_msg
 
 
+def user_record_from_case(case: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a case onto the physical task, including an explicit total integral.
+
+    ``nmr_frequency_nucleus`` stays unknown unless the case itself declares one.
+    The spectrum predictor's default solvent and frequency are not changed here.
+    """
+    raw = {
+        "candidate_smiles": case.get("candidate_smiles"),
+        "c_nmr_peaks": case.get("c_nmr_peaks") if isinstance(case.get("c_nmr_peaks"), list) else [],
+        "h_nmr_peaks": case.get("h_nmr_peaks") if isinstance(case.get("h_nmr_peaks"), list) else [],
+        "nmr_solvent": case.get("nmr_solvent"),
+        "nmr_frequency": case.get("nmr_frequency"),
+    }
+    if "nmr_frequency_nucleus" in case:
+        raw["nmr_frequency_nucleus"] = case.get("nmr_frequency_nucleus")
+    if "experimental_total_nH" in case:
+        raw["experimental_total_nH"] = case.get("experimental_total_nH")
+    return normalize_task_input(raw)
+
+
 async def run_case(url: str, model: str, case: Dict[str, Any],
                    prediction_cache: Dict[str, Any],
                    max_turns: int = 8,
                    allow_remote_predict: bool = True) -> Dict[str, Any]:
-    record = {
-        "candidate_smiles": case["candidate_smiles"],
-        "c_nmr_peaks": project_peaks(case.get("c_nmr_peaks") or [], C_PEAK_FIELDS),
-        "h_nmr_peaks": project_peaks(case.get("h_nmr_peaks") or [], H_PEAK_FIELDS),
-        "nmr_solvent": case.get("nmr_solvent"),
-        "nmr_frequency": case.get("nmr_frequency"),
-    }
+    record = user_record_from_case(case)
+    if not has_experimental_signal(record):
+        raise ValueError("task has no experimental NMR peaks")
     runtime = NmrMatchingRuntime(record, prediction_cache=prediction_cache,
                                  allow_remote_predict=allow_remote_predict)
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": json.dumps(record, ensure_ascii=False)},
+        {"role": "user", "content": task_to_lossless_text(record)},
     ]
     transcript: List[Dict[str, Any]] = []
     async with httpx.AsyncClient() as client:
@@ -146,37 +164,23 @@ async def run_case(url: str, model: str, case: Dict[str, Any],
 
 
 def parse_h_peaks_arg(s: str) -> List[Dict[str, Any]]:
-    """'9.85(1H),7.82(2H),...' -> [{'delta':9.85,'centroid':9.85,'nH':1}, ...]"""
-    out = []
-    for tok in s.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            if "(" in tok:
-                d, nh = tok.split("(", 1)
-                d = float(d.strip())
-                nh_val = int(nh.rstrip(")H ").strip() or 1)
-            else:
-                d = float(tok)
-                nh_val = None
-        except Exception:
-            continue
-        out.append({"delta": d, "centroid": d, "nH": nh_val})
-    return out
+    """Parse ``9.85(1H),7.82(2H)``. An empty parenthesis is an unknown integral, not 1."""
+    return parse_h_peak_list(s, "--h-peaks")
 
 
 def build_case_from_flags(args) -> Dict[str, Any]:
-    c_peaks = []
-    if args.c_peaks:
-        for tok in args.c_peaks.split(","):
-            try:
-                c_peaks.append({"delta (ppm)": float(tok.strip())})
-            except Exception:
-                pass
+    c_peaks = parse_c_peak_list(args.c_peaks, "--c-peaks") if args.c_peaks else []
     h_peaks = parse_h_peaks_arg(args.h_peaks) if args.h_peaks else []
-    return {"candidate_smiles": args.smiles, "c_nmr_peaks": c_peaks, "h_nmr_peaks": h_peaks,
-            "nmr_solvent": args.solvent, "nmr_frequency": args.frequency}
+    case: Dict[str, Any] = {
+        "candidate_smiles": args.smiles,
+        "c_nmr_peaks": c_peaks,
+        "h_nmr_peaks": h_peaks,
+        "nmr_solvent": args.solvent,
+        "nmr_frequency": args.frequency,
+    }
+    if getattr(args, "experimental_total_nH", None) is not None:
+        case["experimental_total_nH"] = args.experimental_total_nH
+    return case
 
 
 def main():
@@ -195,7 +199,9 @@ def main():
     ap.add_argument("--h-peaks", default="",
                     help="逗号分隔 1H,格式 '9.85(1H),7.82(2H)',配合 --smiles")
     ap.add_argument("--solvent", default="CDCl3")
-    ap.add_argument("--frequency", type=float, default=400.0)
+    ap.add_argument("--frequency", type=float, default=400.0,
+                    help="Caller default only. It is not a measured nucleus assignment.")
+    ap.add_argument("--experimental-total-nH", dest="experimental_total_nH", type=float, default=None)
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--output", default="")
     args = ap.parse_args()

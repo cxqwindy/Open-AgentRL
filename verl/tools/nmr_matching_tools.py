@@ -55,29 +55,38 @@ def _extract_first_user_content(raw_prompt: Optional[List[Dict[str, Any]]]) -> O
     return None
 
 
+_TASK_INPUT_MODULE = None
+
+
+def _task_input_module():
+    global _TASK_INPUT_MODULE
+    if _TASK_INPUT_MODULE is None:
+        repo_root = Path(__file__).resolve().parents[2]
+        path = repo_root / "recipe" / "nmr_matching_agent" / "task_input.py"
+        _TASK_INPUT_MODULE = _load_module_from_path("nmr_task_input_for_rl", str(path))
+    return _TASK_INPUT_MODULE
+
+
 def _build_record_from_user_json(user_obj: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Build a matching-runtime record. Returns (record, error_message_or_None)."""
-    cand = user_obj.get("candidate_smiles") or user_obj.get("candidate")
-    if isinstance(user_obj.get("input"), dict) and not cand:
-        cand = user_obj["input"].get("candidate_smiles")
-    if not isinstance(cand, str) or not cand.strip():
-        return {}, "missing candidate_smiles in user JSON"
+    """Project user JSON onto physical task fields.
 
-    h_peaks = user_obj.get("h_nmr_peaks") if isinstance(user_obj.get("h_nmr_peaks"), list) else []
-    c_peaks = user_obj.get("c_nmr_peaks") if isinstance(user_obj.get("c_nmr_peaks"), list) else []
-    if not h_peaks and not c_peaks:
+    Peak objects are not copied raw, so a label or ground-truth key attached to
+    a peak cannot enter the runtime record. Harness ids are dropped as well.
+    """
+    task_input = _task_input_module()
+    source = dict(user_obj)
+    nested = source.get("input")
+    if isinstance(nested, dict) and not (source.get("candidate_smiles") or source.get("candidate")):
+        for key in task_input.TASK_FIELDS:
+            if key in nested and key not in source:
+                source[key] = nested[key]
+    try:
+        task = task_input.normalize_task_input(source)
+    except (TypeError, ValueError) as exc:
+        return {}, str(exc)
+    if not task_input.has_experimental_signal(task):
         return {}, "record has no NMR peaks"
-
-    rec: Dict[str, Any] = {
-        "idx": user_obj.get("idx", -1),
-        "candidate_smiles": cand.strip(),
-        "h_nmr_peaks": h_peaks,
-        "c_nmr_peaks": c_peaks,
-        "nmr_solvent": user_obj.get("nmr_solvent"),
-        "nmr_frequency": user_obj.get("nmr_frequency"),
-        "experimental_total_nH": user_obj.get("experimental_total_nH"),
-    }
-    return rec, None
+    return task, None
 
 
 @dataclass

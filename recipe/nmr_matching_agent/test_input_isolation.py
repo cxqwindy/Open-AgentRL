@@ -274,7 +274,11 @@ def test_t2_from_test_model_router_and_template(tmp_path, monkeypatch):
     path, records = _write_from_test(tmp_path)
     items = infer.load_from_test(str(path), None)
     assert items[0]["inference_input"]["candidate_smiles"] == "CCO"
-    assert items[0]["inference_input"]["nmr_solvent"] is None
+    # 02B-1 reads the explicit Alpaca header. The same string on both headers
+    # stays one raw frequency and does not become a 13C and a 1H measurement.
+    assert items[0]["inference_input"]["nmr_solvent"] == "CDCl3"
+    assert items[0]["inference_input"]["nmr_frequency"] == "400 MHz"
+    assert items[0]["inference_input"]["nmr_frequency_nucleus"] == "unknown"
     assert items[0]["inference_input"]["h_nmr_peaks"][0]["nH"] == 2
     assert items[0]["pair_id"] != items[1]["pair_id"]
     assert items[0]["evaluation_meta"]["sample_id"] == items[1]["evaluation_meta"]["sample_id"] == "dup"

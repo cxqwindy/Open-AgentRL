@@ -67,7 +67,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
 
 from nmr_matching_runtime import NmrMatchingRuntime  # noqa: E402
-from recipe.nmr_matching_agent.task_input import normalize_task_input  # noqa: E402
+from recipe.nmr_matching_agent.task_input import normalize_task_input, task_to_lossless_text  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -662,10 +662,9 @@ def build_prefilled_messages(
     The model should then proceed directly to a final <answer>.
     """
     tr = router_result.tool_results
-    task = normalize_task_input(case)
     msgs: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
+        {"role": "user", "content": task_to_lossless_text(case)},
     ]
     tool_sequence: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = [
         ("count_atoms",         {"element": "C"}, tr.count_c),

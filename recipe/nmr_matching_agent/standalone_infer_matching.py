@@ -25,12 +25,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -46,8 +47,14 @@ from recipe.nmr_matching_agent.task_input import (  # noqa: E402
     H_PEAK_FIELDS,
     HARNESS_PAIR_ID_KEY,
     HARNESS_RUN_ID_KEY,
+    SCHEMA_VERSION,
+    has_experimental_signal,
     normalize_task_input,
+    parse_alpaca_input,
+    parse_task_text,
     project_peaks,
+    task_to_lossless_text,
+    value_presence,
 )
 
 ACTION_RE = re.compile(r"<tool_call>\s*({[\s\S]*?})\s*</tool_call>", re.IGNORECASE)
@@ -139,44 +146,8 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# input parsing (candidate + peaks)
-# ---------------------------------------------------------------------------
-_C_NMR_RE = re.compile(r"13C NMR[^:]*:\s*([^\n]+)", re.IGNORECASE)
-_H_NMR_RE = re.compile(r"1H NMR[^:]*:\s*([^\n]+)", re.IGNORECASE)
-_CAND_RE = re.compile(r"Candidate SMILES:\s*(\S+)", re.IGNORECASE)
-_H_PEAK_RE = re.compile(r"([0-9]+\.?[0-9]*)\s*\(([^)]*)\)")
-
-
-def parse_alpaca_input(input_text: str) -> Dict[str, Any]:
-    """Parse the alpaca `input` string (Candidate SMILES + 13C/1H NMR lines) into a case dict."""
-    cand_m = _CAND_RE.search(input_text)
-    candidate = cand_m.group(1).strip() if cand_m else ""
-
-    c_peaks: List[Dict[str, Any]] = []
-    cm = _C_NMR_RE.search(input_text)
-    if cm and "N/A" not in cm.group(1):
-        for tok in cm.group(1).split(","):
-            tok = tok.strip()
-            try:
-                c_peaks.append({"delta (ppm)": float(tok)})
-            except ValueError:
-                continue
-
-    h_peaks: List[Dict[str, Any]] = []
-    hm = _H_NMR_RE.search(input_text)
-    if hm and "N/A" not in hm.group(1):
-        for delta_s, inner in _H_PEAK_RE.findall(hm.group(1)):
-            try:
-                delta = float(delta_s)
-            except ValueError:
-                continue
-            nH = None
-            m_nh = re.search(r"(\d+)\s*H", inner)
-            if m_nh:
-                nH = int(m_nh.group(1))
-            h_peaks.append({"delta": delta, "centroid": delta, "nH": nH})
-    return {"candidate_smiles": candidate, "c_nmr_peaks": c_peaks, "h_nmr_peaks": h_peaks}
+# Alpaca / lossless parsing lives in task_input.parse_task_text. The names
+# below stay importable for the historical CLI and parquet builder.
 
 
 def build_user_case(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -232,10 +203,9 @@ def load_tools(
 
 
 def make_messages(case: Dict[str, Any]) -> List[Dict[str, str]]:
-    task = normalize_task_input(case)
     return [
         {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": json.dumps(task, ensure_ascii=False)},
+        {"role": "user", "content": task_to_lossless_text(case)},
     ]
 
 
@@ -563,6 +533,7 @@ _PHYSICAL_KEYS = (
     "nmr_solvent",
     "solvent",
     "nmr_frequency",
+    "nmr_frequency_nucleus",
     "nmr_freq",
     "experimental_total_nH",
 )
@@ -628,29 +599,81 @@ def _merge_peak_lists(text_peaks: List[Any], struct_peaks: List[Any], nucleus: s
     return merged
 
 
-def _compose_inference_input(rec: Dict[str, Any]) -> Dict[str, Any]:
+def _field_was_provided(source: Mapping[str, Any], key: str, explicit_null: bool) -> bool:
+    if key not in source:
+        return False
+    if explicit_null:
+        return True
+    return source.get(key) is not None and source.get(key) != ""
+
+
+def _resolved_scalars(structured: Mapping[str, Any]) -> Dict[str, Any]:
+    """Apply the historical alias priority before comparing text with structured fields."""
+    resolved: Dict[str, Any] = {}
+    if "nmr_solvent" in structured or "solvent" in structured:
+        resolved["nmr_solvent"] = structured.get("nmr_solvent") or structured.get("solvent")
+    if "nmr_frequency" in structured or "nmr_freq" in structured:
+        resolved["nmr_frequency"] = structured.get("nmr_frequency") or structured.get("nmr_freq")
+    if "nmr_frequency_nucleus" in structured:
+        resolved["nmr_frequency_nucleus"] = structured.get("nmr_frequency_nucleus")
+    if "experimental_total_nH" in structured:
+        resolved["experimental_total_nH"] = structured.get("experimental_total_nH")
+    return resolved
+
+
+def _merge_source_value(
+    name: str,
+    text: Optional[Dict[str, Any]],
+    structured: Mapping[str, Any],
+    key: str,
+    *,
+    text_explicit_null: bool,
+) -> Any:
+    """Keep a one-sided value. An explicit disagreement, including null versus known, raises."""
+    text_has = text is not None and _field_was_provided(text, key, text_explicit_null)
+    struct_has = _field_was_provided(structured, key, True)
+    if text_has and struct_has and text.get(key) != structured.get(key):
+        raise ValueError(f"{name} differs between text input and structured fields")
+    if struct_has:
+        return structured.get(key)
+    if text_has and text is not None:
+        return text.get(key)
+    return None
+
+
+def _compose_inference_input(rec: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build the physical task from text and structured fields.
 
     Rules:
-    - A non-empty ``input`` string is parsed with the existing alpaca parser.
-      Solvent, frequency, and total integration are not read from that text.
+    - A JSON object string is the lossless task. Legacy Alpaca text is still
+      read, including an explicit solvent, raw frequency, J, multiplicity, and
+      range. A copied header frequency stays one string with nucleus unknown.
     - Structured aliases keep their old priority. Gold keys such as ``_label``,
       ``_gt_smiles``, and ``_candidate_smiles`` are not candidate or peak sources.
     - A candidate or peak list supplied by only one source is kept. Supplying the
       same candidate alongside text does not drop the text spectrum.
-    - If both sources provide a candidate or a peak list and the values disagree,
-      raise. The label is not used to choose a side.
-    - An empty spectrum is an error, not a task that can be sent to inference.
-    - With no text, the structured record is normalized exactly as before.
+    - If both sources provide a value and they disagree, raise. Null versus a
+      known value is a disagreement. The label is not used to choose a side.
+    - Both nuclei without a usable peak is an error, not a task that can be sent
+      to inference.
     """
     text_raw = rec.get("input")
-    text = parse_alpaca_input(text_raw) if isinstance(text_raw, str) and text_raw.strip() else None
+    diagnostics: Dict[str, Any] = {
+        "format": "structured",
+        "warnings": [],
+        "conflicts": [],
+        "headers": [],
+    }
+    text = None
+    if isinstance(text_raw, str) and text_raw.strip():
+        text, diagnostics = parse_task_text(text_raw)
     structured = {key: rec[key] for key in _PHYSICAL_KEYS if key in rec}
+    text_explicit_null = diagnostics.get("format") == "lossless_json"
     if text is None:
         task = normalize_task_input(structured)
-        if not task["c_nmr_peaks"] and not task["h_nmr_peaks"]:
+        if not has_experimental_signal(task):
             raise ValueError("task has no experimental NMR peaks")
-        return task
+        return task, diagnostics
 
     text_candidate = text.get("candidate_smiles") or None
     structured_candidate = structured.get("candidate_smiles") or structured.get("candidate") or None
@@ -670,18 +693,23 @@ def _compose_inference_input(rec: Dict[str, Any]) -> Dict[str, Any]:
         _present_peaks(structured, "h_nmr_peaks", "experimental_1h_peaks", "H"),
         "1H",
     )
-    if not c_peaks and not h_peaks:
-        raise ValueError("task has no experimental NMR peaks")
     merged: Dict[str, Any] = {
         "candidate_smiles": candidate,
         "c_nmr_peaks": c_peaks,
         "h_nmr_peaks": h_peaks,
-        "nmr_solvent": structured.get("nmr_solvent") or structured.get("solvent"),
-        "nmr_frequency": structured.get("nmr_frequency") or structured.get("nmr_freq"),
     }
-    if "experimental_total_nH" in structured:
-        merged["experimental_total_nH"] = structured["experimental_total_nH"]
-    return normalize_task_input(merged)
+    resolved = _resolved_scalars(structured)
+    for key in ("nmr_solvent", "nmr_frequency", "nmr_frequency_nucleus", "experimental_total_nH"):
+        text_has_key = bool(text_explicit_null and text is not None and key in text)
+        value = _merge_source_value(
+            key, text, resolved, key, text_explicit_null=text_has_key
+        )
+        if value is not None or text_has_key or key in resolved:
+            merged[key] = value
+    task = normalize_task_input(merged)
+    if not has_experimental_signal(task):
+        raise ValueError("task has no experimental NMR peaks")
+    return task, diagnostics
 
 
 def _pair_index_for(rec: Dict[str, Any], local_index: int) -> int:
@@ -728,10 +756,40 @@ def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
     run_id = _harness_run_id(rec)
     if run_id is not None:
         meta["run_id"] = run_id
+    task, diagnostics = _compose_inference_input(rec)
+    hash_material = {
+        "input": rec.get("input") if isinstance(rec.get("input"), str) else None,
+        "structured": {key: rec[key] for key in _PHYSICAL_KEYS if key in rec},
+    }
+    encoded = json.dumps(hash_material, ensure_ascii=False, sort_keys=True, allow_nan=False, default=str)
     return {
         "pair_id": pair_index,
         "run_id": run_id,
-        "inference_input": _compose_inference_input(rec),
+        "inference_input": task,
+        "input_sidecar": {
+            "schema_version": SCHEMA_VERSION,
+            "input_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            "format": diagnostics.get("format"),
+            "warnings": diagnostics.get("warnings") or [],
+            "conflicts": diagnostics.get("conflicts") or [],
+            "headers": diagnostics.get("headers") or [],
+            "field_presence": {
+                key: value_presence(rec, key)
+                for key in (
+                    "c_nmr_peaks",
+                    "h_nmr_peaks",
+                    "nmr_frequency",
+                    "nmr_frequency_nucleus",
+                    "experimental_total_nH",
+                )
+            },
+            "runtime_projection": (
+                "NmrMatchingRuntime loads peak lists with `or []`. A null list "
+                "therefore becomes an empty list inside the tool. field_presence "
+                "keeps the original missing/null/empty distinction and is not a "
+                "substitute for the exact spectrum fingerprint."
+            ),
+        },
         "evaluation_meta": meta,
     }
 

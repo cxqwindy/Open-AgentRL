@@ -38,6 +38,7 @@ class MatchRequest(BaseModel):
     h_nmr_peaks: List[Dict[str, Any]] = Field(default_factory=list)
     nmr_solvent: Optional[str] = None
     nmr_frequency: Optional[str] = None
+    nmr_frequency_nucleus: Optional[str] = None
     experimental_total_nH: Optional[float] = None
     include_model_reasoning_in_key_evidence: bool = False
 

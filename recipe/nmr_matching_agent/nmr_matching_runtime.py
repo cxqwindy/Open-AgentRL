@@ -32,6 +32,8 @@ from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 from scipy.optimize import linear_sum_assignment
 
+from recipe.nmr_matching_agent.task_input import describe_integrals
+
 try:  # silence RDKit sanitize spam
     from rdkit import RDLogger
 
@@ -92,19 +94,14 @@ def _count_hydrogens(mol: Chem.Mol) -> int:
 
 
 def _experimental_h_total(h_peaks: List[Dict[str, Any]]) -> Optional[int]:
-    """Sum of integrations (nH) over the 1H peaks, if available."""
-    if not h_peaks:
+    """Complete peak-table integral, or None when any peak integral is unknown.
+
+    A partial sum is not returned. ``h_tolerance`` is not applied here.
+    """
+    described = describe_integrals(h_peaks, None)
+    if not described["peak_table_complete"]:
         return None
-    total = 0
-    saw = False
-    for p in h_peaks:
-        if isinstance(p, dict) and p.get("nH") is not None:
-            try:
-                total += int(round(float(p["nH"])))
-                saw = True
-            except Exception:
-                continue
-    return total if saw else None
+    return described["peak_table_nH_sum"]
 
 
 # ---------------------------------------------------------------------------
@@ -210,21 +207,30 @@ class NmrMatchingRuntime:
             return obs, {"cand_count": cand_count, "exp_signals": exp_signals}
 
         # element == "H"
+        # h_tolerance is unchanged. An incomplete peak table is not a total, and
+        # an explicit total that disagrees with a complete peak table is not used.
         cand_count = _count_hydrogens(self._mol)
-        exp_total = _experimental_h_total(self.h_peaks)
-        # Fallback: read pre-computed total from the record directly (e.g. from --input JSON)
+        integrals = describe_integrals(self.h_peaks, self.record.get("experimental_total_nH"))
+        exp_total = integrals["experimental_total_nH"]
         if exp_total is None:
-            raw_total = self.record.get("experimental_total_nH")
-            if raw_total is not None:
-                try:
-                    exp_total = int(round(float(raw_total)))
-                except (TypeError, ValueError):
-                    pass
-        if exp_total is None:
-            note = (
-                f"candidate has {cand_count} H atoms; 1H integrations unavailable in this spectrum, "
-                "cannot compare counts."
-            )
+            if integrals["integral_conflict"]:
+                note = (
+                    f"candidate has {cand_count} H atoms; explicit total "
+                    f"{integrals['explicit_experimental_total_nH']} conflicts with complete "
+                    f"peak-table sum {integrals['peak_table_nH_sum']}. Neither is used as the total."
+                )
+            elif integrals["completeness"] == "partial":
+                note = (
+                    f"candidate has {cand_count} H atoms; only "
+                    f"{integrals['known_nH_count']} of {integrals['peak_count']} peak integrals "
+                    f"are known (known sum {integrals['known_nH_sum']}). "
+                    "That partial sum is not the experimental total."
+                )
+            else:
+                note = (
+                    f"candidate has {cand_count} H atoms; 1H integrations unavailable in this spectrum, "
+                    "cannot compare counts."
+                )
             match = None
             exact_match = None
             difference = None
@@ -249,6 +255,11 @@ class NmrMatchingRuntime:
             "element": "H",
             "candidate_count": cand_count,
             "experimental_total_nH": exp_total,
+            "known_nH_sum": integrals["known_nH_sum"],
+            "peak_table_nH_sum": integrals["peak_table_nH_sum"],
+            "peak_table_complete": integrals["peak_table_complete"],
+            "integral_conflict": integrals["integral_conflict"],
+            "integral_completeness": integrals["completeness"],
             "match": match,
             "exact_match": exact_match,
             "difference": difference,
@@ -424,7 +435,14 @@ class NmrMatchingRuntime:
         nm=sum(x["matched"] for x in assignments);ne=len(exp_peaks);np=len(pred_peaks);stats={"n":len(resids),"mae":round(sum(resids)/len(resids),4),"rmse":round(math.sqrt(sum(x*x for x in resids)/len(resids)),4),"max_abs":max(resids)}
         obs={"contract_version":2,"algorithm":"hungarian_max_in_tolerance_then_min_abs","nucleus":nucleus,"tol_ppm":tol,"n_exp":ne,"n_pred":np,"n_assigned":len(paired),"n_matched":nm,"n_unmatched":len(unexp),"n_unmatched_exp":len(unexp),"n_unmatched_pred":len(unpred),"coverage":round(nm/ne,4),"exp_coverage":round(nm/ne,4),"pred_coverage":round(nm/np,4),"symmetric_coverage":round(nm/max(ne,np),4),"assignments":assignments,"unmatched_exp_ppm":unexp,"unmatched_pred_ppm":unpred,"large_residual_threshold_ppm":large_tol,"n_large_residual":len(large),"large_residuals":large,"residual_stats":stats,"ok":True,"status":"ok"}
         if nucleus == "H" and pred.get("H_groups") is not None:
-            obs["predicted_group_sizes"] = sorted(len(g) for g in pred["H_groups"]);obs["experimental_integrations"] = sorted(int(p["nH"]) for p in self.h_peaks if p.get("nH") is not None)
+            obs["predicted_group_sizes"] = sorted(len(g) for g in pred["H_groups"])
+            integrals = describe_integrals(self.h_peaks, self.record.get("experimental_total_nH"))
+            obs["integral_complete"] = integrals["peak_table_complete"]
+            if integrals["peak_table_complete"]:
+                obs["experimental_integrations"] = sorted(int(p["nH"]) for p in self.h_peaks if p.get("nH") is not None)
+            else:
+                obs["experimental_integrations"] = None
+                obs["known_nH_values"] = integrals["known_nH_values"]
         return obs,{"n_matched":nm,"n_unmatched_exp":len(unexp),"n_unmatched_pred":len(unpred),"n_large_residual":len(large),"max_abs_residual":stats["max_abs"]}
 
 

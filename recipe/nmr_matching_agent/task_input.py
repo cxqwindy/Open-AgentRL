@@ -6,12 +6,21 @@ and other evaluation metadata stay outside this object.
 
 ``normalize_task_input`` does not modify the caller's objects. Calling it on
 its own result returns an equal dictionary.
+
+Schema ``nmr-task-v2`` adds ``nmr_frequency_nucleus``. When the input does not
+itself declare a nucleus, the value is ``unknown``. A numeric magnitude is
+never used to guess ``1H`` or ``13C``.
 """
 
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+import json
+import math
+import re
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+SCHEMA_VERSION = "nmr-task-v2"
 
 # Fields the model, router, and tools are allowed to see.
 TASK_FIELDS: Tuple[str, ...] = (
@@ -20,6 +29,7 @@ TASK_FIELDS: Tuple[str, ...] = (
     "h_nmr_peaks",
     "nmr_solvent",
     "nmr_frequency",
+    "nmr_frequency_nucleus",
     "experimental_total_nH",
 )
 
@@ -40,11 +50,41 @@ H_PEAK_FIELDS: Tuple[str, ...] = (
 
 _C_PEAK_FIELD_SET = frozenset(C_PEAK_FIELDS)
 _H_PEAK_FIELD_SET = frozenset(H_PEAK_FIELDS)
+_KNOWN_FREQUENCY_NUCLEI = frozenset({"1H", "13C", "spectrometer", "unknown"})
+_NUMERIC_PEAK_FIELDS = frozenset({
+    "delta (ppm)",
+    "centroid",
+    "delta",
+    "nH",
+    "rangeMax",
+    "rangeMin",
+})
 
 # Harness bookkeeping. These keys are not task fields and must not be copied
 # into a model message, router record, or tool raw_prompt.
 HARNESS_PAIR_ID_KEY = "_harness_pair_id"
 HARNESS_RUN_ID_KEY = "_harness_run_id"
+
+_CAND_RE = re.compile(r"^Candidate SMILES:\s*(\S+)\s*$", re.IGNORECASE)
+_HEADER_RE = re.compile(
+    r"^(13C|1H)\s+NMR\s*(?:\(([^)]*)\))?\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+_H_PEAK_RE = re.compile(
+    r"^([+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))"
+    r"(?:\s*-\s*([+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)))?"
+    r"(?:\s*\((.*)\))?$"
+)
+_J_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
+_J_RE = re.compile(
+    rf"J\s*=\s*({_J_NUMBER}(?!\s*H)(?:\s*,\s*{_J_NUMBER}(?!\s*H))*)",
+    re.IGNORECASE,
+)
+_NH_RE = re.compile(r"^(\d+)\s*H$", re.IGNORECASE)
+
+
+class TaskInputError(ValueError):
+    """A task could not be read without inventing or dropping physical data."""
 
 
 def project_peaks(peaks: Iterable[Any], allowed: Iterable[str]) -> List[Any]:
@@ -68,6 +108,67 @@ def project_peaks(peaks: Iterable[Any], allowed: Iterable[str]) -> List[Any]:
     return projected
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_finite(value: Any, where: str) -> Any:
+    if value is None:
+        return None
+    if not _is_number(value):
+        raise TaskInputError(f"{where} must be a finite number or null, got {type(value).__name__}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise TaskInputError(f"{where} is not a finite number")
+    return value
+
+
+def _check_peak_numbers(peak: Any, where: str) -> None:
+    if _is_number(peak):
+        _require_finite(peak, where)
+        return
+    if not isinstance(peak, dict):
+        raise TaskInputError(f"{where} must be a peak object or a finite number")
+    for key, value in peak.items():
+        if key not in _NUMERIC_PEAK_FIELDS:
+            if key == "j_values":
+                _check_j_values(value, f"{where}.j_values")
+            continue
+        if key == "nH" and value is None:
+            continue
+        if key not in peak:
+            continue
+        _require_finite(value, f"{where}.{key}")
+
+
+def _check_j_values(value: Any, where: str) -> None:
+    if value is None or isinstance(value, str):
+        return
+    if _is_number(value):
+        _require_finite(value, where)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, str):
+                continue
+            _require_finite(item, f"{where}[{index}]")
+        return
+    raise TaskInputError(f"{where} must be a string, number, list, or null")
+
+
+def _frequency_nucleus(raw: Mapping[str, Any]) -> str:
+    if "nmr_frequency_nucleus" not in raw:
+        return "unknown"
+    value = raw.get("nmr_frequency_nucleus")
+    if value is None or value == "":
+        return "unknown"
+    if value in _KNOWN_FREQUENCY_NUCLEI:
+        return str(value)
+    raise TaskInputError(
+        "nmr_frequency_nucleus must be 1H, 13C, spectrometer, or unknown; "
+        f"got {value!r}. A frequency magnitude is not a nucleus assignment."
+    )
+
+
 def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return a new task dict with aliases resolved and metadata removed.
 
@@ -79,34 +180,54 @@ def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
     - ``h_nmr_peaks`` over ``experimental_1h_peaks``
     - ``nmr_solvent`` over ``solvent``
     - ``nmr_frequency`` over ``nmr_freq``
+
+    ``experimental_total_nH`` of 0 stays 0. A missing integration key is not
+    inserted. ``nmr_frequency_nucleus`` defaults to ``unknown`` and is never
+    inferred from the frequency number.
     """
     if not isinstance(raw, Mapping):
-        raise TypeError("task input must be a mapping")
+        raise TaskInputError("task input must be a mapping")
 
     candidate = raw.get("candidate_smiles") or raw.get("candidate")
     if not candidate:
-        raise ValueError("input must contain candidate_smiles")
+        raise TaskInputError("input must contain candidate_smiles")
 
     c_nmr = raw.get("c_nmr_peaks")
     if not c_nmr:
         flat_c = raw.get("experimental_13c_peaks") or []
-        c_peaks = [{"delta (ppm)": float(value)} for value in flat_c]
+        c_peaks = []
+        for index, value in enumerate(flat_c):
+            number = float(value)
+            if not math.isfinite(number):
+                raise TaskInputError(f"experimental_13c_peaks[{index}] is not a finite number")
+            c_peaks.append({"delta (ppm)": number})
     elif isinstance(c_nmr, list):
         c_peaks = project_peaks(c_nmr, _C_PEAK_FIELD_SET)
     else:
-        raise TypeError("c_nmr_peaks must be a list when provided")
+        raise TaskInputError("c_nmr_peaks must be a list when provided")
 
     h_nmr = raw.get("h_nmr_peaks")
     if not h_nmr:
         flat_h = raw.get("experimental_1h_peaks") or []
-        h_peaks = [
-            {"delta": float(value), "centroid": float(value), "nH": None}
-            for value in flat_h
-        ]
+        h_peaks = []
+        for index, value in enumerate(flat_h):
+            number = float(value)
+            if not math.isfinite(number):
+                raise TaskInputError(f"experimental_1h_peaks[{index}] is not a finite number")
+            h_peaks.append({"delta": number, "centroid": number, "nH": None})
     elif isinstance(h_nmr, list):
         h_peaks = project_peaks(h_nmr, _H_PEAK_FIELD_SET)
     else:
-        raise TypeError("h_nmr_peaks must be a list when provided")
+        raise TaskInputError("h_nmr_peaks must be a list when provided")
+
+    for index, peak in enumerate(c_peaks):
+        _check_peak_numbers(peak, f"c_nmr_peaks[{index}]")
+    for index, peak in enumerate(h_peaks):
+        _check_peak_numbers(peak, f"h_nmr_peaks[{index}]")
+
+    total = raw.get("experimental_total_nH")
+    if total is not None:
+        _require_finite(total, "experimental_total_nH")
 
     return {
         "candidate_smiles": candidate,
@@ -114,5 +235,390 @@ def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
         "h_nmr_peaks": h_peaks,
         "nmr_solvent": raw.get("nmr_solvent") or raw.get("solvent"),
         "nmr_frequency": raw.get("nmr_frequency") or raw.get("nmr_freq"),
-        "experimental_total_nH": raw.get("experimental_total_nH"),
+        "nmr_frequency_nucleus": _frequency_nucleus(raw),
+        "experimental_total_nH": total,
+    }
+
+
+def value_presence(source: Mapping[str, Any], key: str) -> str:
+    """Distinguish a missing key, JSON null, and an empty list.
+
+    The runtime still projects null peak lists to ``[]``. That projection is
+    not this presence value and is not an exact spectrum fingerprint.
+    """
+    if key not in source:
+        return "missing"
+    value = source.get(key)
+    if value is None:
+        return "null"
+    if value == []:
+        return "empty_list"
+    return "present"
+
+
+def peak_has_signal(peak: Any, nucleus: str) -> bool:
+    """A finite shift, or an explicit finite range, is a usable experimental peak."""
+    if _is_number(peak):
+        return isinstance(peak, float) is False or math.isfinite(peak)
+    if not isinstance(peak, dict):
+        return False
+    if nucleus == "C":
+        value = peak.get("delta (ppm)")
+        return _is_number(value) and (not isinstance(value, float) or math.isfinite(value))
+    for key in ("centroid", "delta", "rangeMin", "rangeMax"):
+        value = peak.get(key)
+        if _is_number(value) and (not isinstance(value, float) or math.isfinite(value)):
+            return True
+    return False
+
+
+def has_experimental_signal(task: Mapping[str, Any]) -> bool:
+    carbons = task.get("c_nmr_peaks") or []
+    protons = task.get("h_nmr_peaks") or []
+    return any(peak_has_signal(peak, "C") for peak in carbons) or any(
+        peak_has_signal(peak, "H") for peak in protons
+    )
+
+
+def task_to_lossless_text(task: Mapping[str, Any]) -> str:
+    """Serialize the normalized task. This does not round chemical shifts."""
+    normalized = normalize_task_input(task)
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
+def _reject_json_constant(name: str) -> None:
+    raise TaskInputError(f"non-finite JSON constant: {name}")
+
+
+def _split_top_level_commas(text: str) -> List[str]:
+    parts: List[str] = []
+    buffer: List[str] = []
+    depth = 0
+    for char in text:
+        if char == "(":
+            depth += 1
+            buffer.append(char)
+        elif char == ")":
+            if depth == 0:
+                raise TaskInputError(f"unbalanced parenthesis in {text!r}")
+            depth -= 1
+            buffer.append(char)
+        elif char == "," and depth == 0:
+            parts.append("".join(buffer).strip())
+            buffer = []
+        else:
+            buffer.append(char)
+    if depth != 0:
+        raise TaskInputError(f"unbalanced parenthesis in {text!r}")
+    tail = "".join(buffer).strip()
+    if tail:
+        parts.append(tail)
+    return [part for part in parts if part]
+
+
+def _parse_explicit_float(token: str, where: str) -> float:
+    try:
+        value = float(token)
+    except ValueError as exc:
+        raise TaskInputError(f"invalid number at {where}: {token!r}") from exc
+    if not math.isfinite(value):
+        raise TaskInputError(f"non-finite number at {where}: {token!r}")
+    return value
+
+
+def _parse_h_inner(inner: Optional[str], where: str) -> Dict[str, Any]:
+    if inner is None or inner.strip() == "":
+        return {}
+    j_match = _J_RE.search(inner)
+    if re.search(r"J\s*=", inner, re.IGNORECASE) and j_match is None:
+        raise TaskInputError(f"unsupported J token at {where}: {inner!r}")
+    rest = inner
+    j_raw = None
+    if j_match is not None:
+        j_raw = j_match.group(1).strip()
+        rest = inner[: j_match.start()] + inner[j_match.end() :]
+    kept: Dict[str, Any] = {}
+    category = None
+    saw_nh = False
+    for piece in _split_top_level_commas(rest):
+        if not piece:
+            continue
+        nh_match = _NH_RE.fullmatch(piece.strip())
+        if nh_match:
+            if saw_nh:
+                raise TaskInputError(f"multiple nH values at {where}: {inner!r}")
+            kept["nH"] = int(nh_match.group(1))
+            saw_nh = True
+            continue
+        if category is None:
+            category = piece.strip()
+            continue
+        raise TaskInputError(f"unsupported token at {where}: {piece!r}")
+    if category is not None:
+        kept["category"] = category
+    if j_raw is not None:
+        kept["j_values"] = j_raw
+    return kept
+
+
+def parse_h_peak_token(token: str, where: str) -> Dict[str, Any]:
+    """Parse one proton token. A missing integral stays missing, including ``9.85()``."""
+    match = _H_PEAK_RE.fullmatch(token.strip())
+    if match is None:
+        raise TaskInputError(f"unsupported 1H peak at {where}: {token!r}")
+    left, right, inner = match.group(1), match.group(2), match.group(3)
+    peak = _parse_h_inner(inner, where)
+    if right is None:
+        shift = _parse_explicit_float(left, where)
+        peak["delta"] = shift
+        peak["centroid"] = shift
+        return peak
+    peak["rangeMin"] = _parse_explicit_float(left, where)
+    peak["rangeMax"] = _parse_explicit_float(right, where)
+    return peak
+
+
+def parse_h_peak_list(text: str, where: str = "1H") -> List[Dict[str, Any]]:
+    if text is None:
+        return []
+    stripped = text.strip()
+    if not stripped or stripped.casefold() == "n/a":
+        return []
+    peaks = []
+    for index, token in enumerate(_split_top_level_commas(stripped), 1):
+        peaks.append(parse_h_peak_token(token, f"{where} peak {index}"))
+    return peaks
+
+
+def parse_c_peak_list(text: str, where: str = "13C") -> List[Dict[str, Any]]:
+    if text is None:
+        return []
+    stripped = text.strip()
+    if not stripped or stripped.casefold() == "n/a":
+        return []
+    peaks = []
+    for index, token in enumerate(_split_top_level_commas(stripped), 1):
+        peaks.append({
+            "delta (ppm)": _parse_explicit_float(token, f"{where} peak {index}"),
+        })
+    return peaks
+
+
+def _split_header_parenthetical(inner: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if inner is None or not inner.strip():
+        return None, None
+    frequency = None
+    solvent_parts: List[str] = []
+    for part in (piece.strip() for piece in inner.split(",")):
+        if not part:
+            continue
+        if frequency is None and re.search(r"Hz|not_known", part, re.IGNORECASE):
+            frequency = part
+        else:
+            solvent_parts.append(part)
+    solvent = ", ".join(solvent_parts) or None
+    return frequency, solvent
+
+
+def _same_or_conflict(
+    left: Optional[str],
+    right: Optional[str],
+    field: str,
+    diagnostics: Dict[str, Any],
+) -> Optional[str]:
+    if left and right:
+        if left == right:
+            diagnostics["warnings"].append({
+                "code": "header_value_copied",
+                "field": field,
+                "value": left,
+                "note": (
+                    "The 13C and 1H headers carry the same string. "
+                    "It is kept once and the nucleus assignment stays unknown."
+                ),
+            })
+            return left
+        diagnostics["conflicts"].append({
+            "code": "header_values_differ",
+            "field": field,
+            "13C_header": left,
+            "1H_header": right,
+            "note": "Neither value is selected and no 4x conversion is applied.",
+        })
+        return None
+    return left or right
+
+
+def _parse_alpaca_text(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    diagnostics: Dict[str, Any] = {
+        "format": "alpaca_text",
+        "warnings": [],
+        "conflicts": [],
+        "headers": [],
+        "nucleus_assignment": "unknown",
+    }
+    candidate = None
+    carbon_lines = []
+    proton_lines = []
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        candidate_match = _CAND_RE.match(line)
+        if candidate_match:
+            found = candidate_match.group(1).strip()
+            if candidate is not None and found != candidate:
+                raise TaskInputError(
+                    f"line {line_number}: candidate SMILES {found!r} conflicts with {candidate!r}"
+                )
+            candidate = found
+            continue
+        header = _HEADER_RE.match(line)
+        if header:
+            section = header.group(1).upper()
+            parenthetical = header.group(2)
+            body = header.group(3).strip()
+            frequency, solvent = _split_header_parenthetical(parenthetical)
+            diagnostics["headers"].append({
+                "line": line_number,
+                "section": section,
+                "parenthetical": parenthetical,
+                "frequency_raw": frequency,
+                "solvent_raw": solvent,
+            })
+            target = carbon_lines if section == "13C" else proton_lines
+            target.append((line_number, body, frequency, solvent))
+            continue
+        raise TaskInputError(f"line {line_number}: unsupported task text: {line!r}")
+    if len(carbon_lines) > 1 or len(proton_lines) > 1:
+        raise TaskInputError("repeated 13C or 1H NMR line")
+    task: Dict[str, Any] = {
+        "candidate_smiles": candidate or "",
+        "c_nmr_peaks": [],
+        "h_nmr_peaks": [],
+    }
+    carbon_frequency = proton_frequency = None
+    carbon_solvent = proton_solvent = None
+    if carbon_lines:
+        line_number, body, carbon_frequency, carbon_solvent = carbon_lines[0]
+        task["c_nmr_peaks"] = parse_c_peak_list(body, f"line {line_number} 13C")
+    if proton_lines:
+        line_number, body, proton_frequency, proton_solvent = proton_lines[0]
+        task["h_nmr_peaks"] = parse_h_peak_list(body, f"line {line_number} 1H")
+    frequency = _same_or_conflict(carbon_frequency, proton_frequency, "nmr_frequency", diagnostics)
+    solvent = _same_or_conflict(carbon_solvent, proton_solvent, "nmr_solvent", diagnostics)
+    if frequency is not None:
+        task["nmr_frequency"] = frequency
+    if solvent is not None:
+        task["nmr_solvent"] = solvent
+    return task, diagnostics
+
+
+def parse_task_text(text: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Parse a lossless task JSON string or a legacy Alpaca spectrum string.
+
+    JSON gold keys are removed by normalization. Alpaca text does not assign a
+    nucleus just because a header says 13C or 1H. Data the old text cannot
+    express stays absent.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise TaskInputError("task text is empty")
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            loaded = json.loads(stripped, parse_constant=_reject_json_constant)
+        except TaskInputError:
+            raise
+        except json.JSONDecodeError as exc:
+            raise TaskInputError(f"invalid task JSON: {exc.msg} at line {exc.lineno}") from exc
+        if not isinstance(loaded, dict):
+            raise TaskInputError("task JSON must be an object")
+        return normalize_task_input(loaded), {
+            "format": "lossless_json",
+            "warnings": [],
+            "conflicts": [],
+            "nucleus_assignment": _frequency_nucleus(loaded),
+        }
+    return _parse_alpaca_text(text)
+
+
+def parse_alpaca_input(input_text: str) -> Dict[str, Any]:
+    """Return physical fields from an Alpaca spectrum string.
+
+    This is the compatibility reader. It preserves an explicit J value,
+    multiplicity, range, solvent, and the raw frequency string. It does not
+    turn one copied header frequency into two measured frequencies.
+    """
+    task, _diagnostics = parse_task_text(input_text)
+    return task
+
+
+def describe_integrals(h_peaks: Optional[Iterable[Any]], explicit: Any) -> Dict[str, Any]:
+    """Describe proton integrals without promoting a partial sum to the total.
+
+    A complete peak-table sum exists only when every peak has a known finite
+    ``nH``. ``0`` is a known value. Missing and null stay unknown. An explicit
+    ``experimental_total_nH`` is a separate observation. When both exist and
+    differ, neither is selected as the comparison total.
+    """
+    peaks = list(h_peaks or [])
+    known_values: List[Any] = []
+    missing = 0
+    invalid = 0
+    for index, peak in enumerate(peaks):
+        if not isinstance(peak, dict) or "nH" not in peak:
+            missing += 1
+            continue
+        value = peak.get("nH")
+        if value is None:
+            missing += 1
+            continue
+        if not _is_number(value) or (isinstance(value, float) and not math.isfinite(value)):
+            invalid += 1
+            continue
+        known_values.append(value)
+    complete = bool(peaks) and missing == 0 and invalid == 0 and len(known_values) == len(peaks)
+    known_sum: Any = None
+    if known_values:
+        known_sum = known_values[0]
+        for value in known_values[1:]:
+            known_sum += value
+    peak_sum = known_sum if complete else None
+    explicit_value = None
+    explicit_invalid = False
+    if explicit is not None:
+        if not _is_number(explicit) or (isinstance(explicit, float) and not math.isfinite(explicit)):
+            explicit_invalid = True
+        else:
+            explicit_value = explicit
+    conflict = peak_sum is not None and explicit_value is not None and peak_sum != explicit_value
+    if conflict or explicit_invalid:
+        used = None
+        completeness = "conflict" if conflict else "invalid"
+    elif explicit_value is not None:
+        used = explicit_value
+        completeness = "explicit"
+    elif peak_sum is not None:
+        used = peak_sum
+        completeness = "complete"
+    elif known_values:
+        used = None
+        completeness = "partial"
+    else:
+        used = None
+        completeness = "unknown"
+    return {
+        "peak_count": len(peaks),
+        "known_nH_count": len(known_values),
+        "missing_nH_count": missing,
+        "invalid_nH_count": invalid,
+        "known_nH_values": known_values,
+        "known_nH_sum": known_sum if not complete else None,
+        "peak_table_complete": complete,
+        "peak_table_nH_sum": peak_sum,
+        "explicit_experimental_total_nH": explicit_value,
+        "explicit_invalid": explicit_invalid,
+        "integral_conflict": conflict,
+        "experimental_total_nH": used,
+        "completeness": completeness,
     }

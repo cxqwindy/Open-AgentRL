@@ -162,8 +162,12 @@ def test_runtime_h_tolerance_exposes_exact_and_difference_fields() -> None:
         "h_nmr_peaks": [{"delta": 3.6, "nH": 2}, {"delta": 1.2, "nH": 3}],
     }, h_tolerance=2)
     obs, _ = tolerant._handle_count_atoms({"element": "H"})
+    # 02B-1 adds completeness fields. The tolerance, difference, and match are unchanged:
+    # both peak integrals are known, so the complete sum is still 5.
     assert obs == {
         "element": "H", "candidate_count": 6, "experimental_total_nH": 5,
+        "known_nH_sum": None, "peak_table_nH_sum": 5, "peak_table_complete": True,
+        "integral_conflict": False, "integral_completeness": "complete",
         "match": True, "exact_match": False, "difference": 1, "tolerance": 2,
         "note": "candidate has 6 H atoms; 1H integrations sum to 5 protons. Difference 1 is within H-integration tolerance ±2 (e.g. unreported exchangeable H).",
     }
