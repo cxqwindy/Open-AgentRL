@@ -46,6 +46,18 @@ class MatchRequest(BaseModel):
     def require_spectrum(self):
         if not self.c_nmr_peaks and not self.h_nmr_peaks:
             raise ValueError("at least one of c_nmr_peaks or h_nmr_peaks is required")
+        try:
+            normalize_task_input({
+                "candidate_smiles": self.candidate_smiles,
+                "c_nmr_peaks": self.c_nmr_peaks,
+                "h_nmr_peaks": self.h_nmr_peaks,
+                "nmr_solvent": self.nmr_solvent,
+                "nmr_frequency": self.nmr_frequency,
+                "nmr_frequency_nucleus": self.nmr_frequency_nucleus,
+                "experimental_total_nH": self.experimental_total_nH,
+            })
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"MatchRequest candidate {self.candidate_smiles!r}: {exc}") from exc
         return self
 
 

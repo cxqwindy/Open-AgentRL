@@ -83,7 +83,8 @@ def _build_record_from_user_json(user_obj: Dict[str, Any]) -> Tuple[Dict[str, An
     try:
         task = task_input.normalize_task_input(source)
     except (TypeError, ValueError) as exc:
-        return {}, str(exc)
+        located = task_input.annotate_task_error(exc, task_input.task_sample_id(user_obj), "RL tool")
+        return {}, str(located)
     if not task_input.has_experimental_signal(task):
         return {}, "record has no NMR peaks"
     return task, None

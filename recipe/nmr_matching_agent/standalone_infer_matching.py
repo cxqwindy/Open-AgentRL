@@ -48,13 +48,16 @@ from recipe.nmr_matching_agent.task_input import (  # noqa: E402
     HARNESS_PAIR_ID_KEY,
     HARNESS_RUN_ID_KEY,
     SCHEMA_VERSION,
+    TaskInputError,
+    annotate_task_error,
+    describe_input_presence,
     has_experimental_signal,
     normalize_task_input,
     parse_alpaca_input,
     parse_task_text,
     project_peaks,
+    task_sample_id,
     task_to_lossless_text,
-    value_presence,
 )
 
 ACTION_RE = re.compile(r"<tool_call>\s*({[\s\S]*?})\s*</tool_call>", re.IGNORECASE)
@@ -203,9 +206,13 @@ def load_tools(
 
 
 def make_messages(case: Dict[str, Any]) -> List[Dict[str, str]]:
+    try:
+        content = task_to_lossless_text(case)
+    except (TaskInputError, TypeError, ValueError) as exc:
+        raise annotate_task_error(exc, task_sample_id(case), "make_messages") from exc
     return [
         {"role": "system", "content": build_system_prompt()},
-        {"role": "user", "content": task_to_lossless_text(case)},
+        {"role": "user", "content": content},
     ]
 
 
@@ -756,7 +763,12 @@ def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
     run_id = _harness_run_id(rec)
     if run_id is not None:
         meta["run_id"] = run_id
-    task, diagnostics = _compose_inference_input(rec)
+    try:
+        task, diagnostics = _compose_inference_input(rec)
+    except (TaskInputError, TypeError, ValueError) as exc:
+        raise annotate_task_error(
+            exc, _source_sample_id(rec), f"prepare_eval_record pair {pair_index}"
+        ) from exc
     hash_material = {
         "input": rec.get("input") if isinstance(rec.get("input"), str) else None,
         "structured": {key: rec[key] for key in _PHYSICAL_KEYS if key in rec},
@@ -773,16 +785,7 @@ def prepare_eval_record(rec: Dict[str, Any], pair_index: int) -> Dict[str, Any]:
             "warnings": diagnostics.get("warnings") or [],
             "conflicts": diagnostics.get("conflicts") or [],
             "headers": diagnostics.get("headers") or [],
-            "field_presence": {
-                key: value_presence(rec, key)
-                for key in (
-                    "c_nmr_peaks",
-                    "h_nmr_peaks",
-                    "nmr_frequency",
-                    "nmr_frequency_nucleus",
-                    "experimental_total_nH",
-                )
-            },
+            "field_presence": describe_input_presence(rec),
             "runtime_projection": (
                 "NmrMatchingRuntime loads peak lists with `or []`. A null list "
                 "therefore becomes an empty list inside the tool. field_presence "

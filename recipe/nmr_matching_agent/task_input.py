@@ -75,12 +75,11 @@ _H_PEAK_RE = re.compile(
     r"(?:\s*-\s*([+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)))?"
     r"(?:\s*\((.*)\))?$"
 )
-_J_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
-_J_RE = re.compile(
-    rf"J\s*=\s*({_J_NUMBER}(?!\s*H)(?:\s*,\s*{_J_NUMBER}(?!\s*H))*)",
-    re.IGNORECASE,
-)
+_NUMBER_TOKEN = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
 _NH_RE = re.compile(r"^(\d+)\s*H$", re.IGNORECASE)
+_J_EQ_RE = re.compile(rf"^J\s*=\s*({_NUMBER_TOKEN})$", re.IGNORECASE)
+_J_CONT_RE = re.compile(rf"^{_NUMBER_TOKEN}$")
+_CATEGORY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[ \t]+[A-Za-z][A-Za-z0-9]*)*$")
 
 
 class TaskInputError(ValueError):
@@ -120,6 +119,13 @@ def _require_finite(value: Any, where: str) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         raise TaskInputError(f"{where} is not a finite number")
     return value
+
+
+def _require_nonnegative(value: Any, where: str) -> Any:
+    number = _require_finite(value, where)
+    if number is not None and number < 0:
+        raise TaskInputError(f"{where} must be zero or positive, got {number}")
+    return number
 
 
 def _check_peak_numbers(peak: Any, where: str) -> None:
@@ -169,6 +175,136 @@ def _frequency_nucleus(raw: Mapping[str, Any]) -> str:
     )
 
 
+def _candidate_string(raw: Mapping[str, Any]) -> str:
+    """Return the original SMILES string. Dicts, lists, and bools are not coerced."""
+    if "candidate_smiles" in raw and raw.get("candidate_smiles") not in (None, ""):
+        value = raw.get("candidate_smiles")
+        field = "candidate_smiles"
+    elif raw.get("candidate") not in (None, ""):
+        value = raw.get("candidate")
+        field = "candidate"
+    else:
+        raise TaskInputError("input must contain candidate_smiles")
+    if not isinstance(value, str):
+        raise TaskInputError(f"{field} must be a SMILES string, got {type(value).__name__}")
+    from rdkit import Chem
+    from rdkit import RDLogger
+
+    RDLogger.DisableLog("rdApp.error")
+    if Chem.MolFromSmiles(value) is None:
+        raise TaskInputError(f"{field} is not a parseable SMILES: {value!r}")
+    return value
+
+
+def _optional_text(raw: Mapping[str, Any], primary: str, alias: str) -> Optional[str]:
+    if primary in raw and raw.get(primary) not in (None, ""):
+        value = raw.get(primary)
+        field = primary
+    elif raw.get(alias) not in (None, ""):
+        value = raw.get(alias)
+        field = alias
+    else:
+        return None
+    if not isinstance(value, str):
+        raise TaskInputError(f"{field} must be a string or null, got {type(value).__name__}")
+    return value
+
+
+def _scalar_peak(value: Any, nucleus: str, where: str) -> Dict[str, Any]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TaskInputError(f"{where} must be a peak object or a finite shift, got {type(value).__name__}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise TaskInputError(f"{where} is not a finite number")
+    if nucleus == "C":
+        return {"delta (ppm)": value}
+    # A bare number has no written integral. Null keeps it unknown; it is not 1 or 0.
+    return {"delta": value, "centroid": value, "nH": None}
+
+
+def _complete_range(peak: Mapping[str, Any], where: str) -> bool:
+    has_min = "rangeMin" in peak and peak.get("rangeMin") is not None
+    has_max = "rangeMax" in peak and peak.get("rangeMax") is not None
+    if not has_min and not has_max:
+        return False
+    if not has_min or not has_max:
+        raise TaskInputError(f"{where} has an incomplete chemical-shift range")
+    left = _require_finite(peak.get("rangeMin"), f"{where}.rangeMin")
+    right = _require_finite(peak.get("rangeMax"), f"{where}.rangeMax")
+    if left > right:
+        raise TaskInputError(f"{where} has rangeMin greater than rangeMax")
+    return True
+
+
+def _validate_peak_object(peak: Mapping[str, Any], nucleus: str, where: str) -> None:
+    if nucleus == "C":
+        if "delta (ppm)" not in peak or peak.get("delta (ppm)") is None:
+            raise TaskInputError(f"{where} has no finite chemical shift")
+        _require_finite(peak.get("delta (ppm)"), f"{where}.delta (ppm)")
+    else:
+        ranged = _complete_range(peak, where)
+        shift = False
+        for key in ("delta", "centroid"):
+            if key in peak and peak.get(key) is not None:
+                _require_finite(peak.get(key), f"{where}.{key}")
+                shift = True
+        if not shift and not ranged:
+            raise TaskInputError(f"{where} has no finite chemical shift or complete range")
+        if "nH" in peak:
+            _require_nonnegative(peak.get("nH"), f"{where}.nH")
+        if "category" in peak and peak.get("category") is not None and not isinstance(peak.get("category"), str):
+            raise TaskInputError(
+                f"{where}.category must be a string or null, got {type(peak.get('category')).__name__}"
+            )
+        if "j_values" in peak:
+            _check_j_values(peak.get("j_values"), f"{where}.j_values")
+
+
+def _peak_list(raw: Mapping[str, Any], primary: str, alias: str, nucleus: str) -> List[Any]:
+    supplied = raw.get(primary)
+    if not supplied:
+        flat = raw.get(alias) or []
+        if not isinstance(flat, list):
+            raise TaskInputError(f"{alias} must be a list when provided")
+        peaks = []
+        for index, value in enumerate(flat):
+            where = f"{alias}[{index}]"
+            peak = _scalar_peak(value, nucleus, where)
+            _validate_peak_object(peak, nucleus, where)
+            peaks.append(peak)
+        return peaks
+    if not isinstance(supplied, list):
+        raise TaskInputError(f"{primary} must be a list when provided")
+    allowed = _C_PEAK_FIELD_SET if nucleus == "C" else _H_PEAK_FIELD_SET
+    peaks = []
+    for index, value in enumerate(supplied):
+        where = f"{primary}[{index}]"
+        if isinstance(value, dict):
+            peak = project_peaks([value], allowed)[0]
+        else:
+            peak = _scalar_peak(value, nucleus, where)
+        _validate_peak_object(peak, nucleus, where)
+        peaks.append(peak)
+    return peaks
+
+
+def task_sample_id(raw: Mapping[str, Any]) -> Any:
+    """Return a caller-supplied sample locator. It is not a physical task field."""
+    if not isinstance(raw, Mapping):
+        return None
+    for key in ("record_id", "case_id", "source_id", "idx", "id"):
+        if key in raw and raw.get(key) not in (None, ""):
+            return raw.get(key)
+    return None
+
+
+def annotate_task_error(exc: Exception, sample: Any, where: str) -> Exception:
+    """Keep the original error type and add the sample plus the field location."""
+    message = f"{where} sample {sample!r}: {exc}"
+    if isinstance(exc, TaskInputError):
+        return TaskInputError(message)
+    return type(exc)(message)
+
+
 def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
     """Return a new task dict with aliases resolved and metadata removed.
 
@@ -183,61 +319,91 @@ def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
 
     ``experimental_total_nH`` of 0 stays 0. A missing integration key is not
     inserted. ``nmr_frequency_nucleus`` defaults to ``unknown`` and is never
-    inferred from the frequency number.
+    inferred from the frequency number. Every peak that remains must carry a
+    finite shift or a complete range. Empty peak objects are rejected at their
+    index instead of being dropped or counted.
     """
     if not isinstance(raw, Mapping):
         raise TaskInputError("task input must be a mapping")
 
-    candidate = raw.get("candidate_smiles") or raw.get("candidate")
-    if not candidate:
-        raise TaskInputError("input must contain candidate_smiles")
-
-    c_nmr = raw.get("c_nmr_peaks")
-    if not c_nmr:
-        flat_c = raw.get("experimental_13c_peaks") or []
-        c_peaks = []
-        for index, value in enumerate(flat_c):
-            number = float(value)
-            if not math.isfinite(number):
-                raise TaskInputError(f"experimental_13c_peaks[{index}] is not a finite number")
-            c_peaks.append({"delta (ppm)": number})
-    elif isinstance(c_nmr, list):
-        c_peaks = project_peaks(c_nmr, _C_PEAK_FIELD_SET)
-    else:
-        raise TaskInputError("c_nmr_peaks must be a list when provided")
-
-    h_nmr = raw.get("h_nmr_peaks")
-    if not h_nmr:
-        flat_h = raw.get("experimental_1h_peaks") or []
-        h_peaks = []
-        for index, value in enumerate(flat_h):
-            number = float(value)
-            if not math.isfinite(number):
-                raise TaskInputError(f"experimental_1h_peaks[{index}] is not a finite number")
-            h_peaks.append({"delta": number, "centroid": number, "nH": None})
-    elif isinstance(h_nmr, list):
-        h_peaks = project_peaks(h_nmr, _H_PEAK_FIELD_SET)
-    else:
-        raise TaskInputError("h_nmr_peaks must be a list when provided")
-
-    for index, peak in enumerate(c_peaks):
-        _check_peak_numbers(peak, f"c_nmr_peaks[{index}]")
-    for index, peak in enumerate(h_peaks):
-        _check_peak_numbers(peak, f"h_nmr_peaks[{index}]")
-
     total = raw.get("experimental_total_nH")
-    if total is not None:
-        _require_finite(total, "experimental_total_nH")
+    if "experimental_total_nH" in raw:
+        _require_nonnegative(total, "experimental_total_nH")
 
     return {
-        "candidate_smiles": candidate,
-        "c_nmr_peaks": c_peaks,
-        "h_nmr_peaks": h_peaks,
-        "nmr_solvent": raw.get("nmr_solvent") or raw.get("solvent"),
-        "nmr_frequency": raw.get("nmr_frequency") or raw.get("nmr_freq"),
+        "candidate_smiles": _candidate_string(raw),
+        "c_nmr_peaks": _peak_list(raw, "c_nmr_peaks", "experimental_13c_peaks", "C"),
+        "h_nmr_peaks": _peak_list(raw, "h_nmr_peaks", "experimental_1h_peaks", "H"),
+        "nmr_solvent": _optional_text(raw, "nmr_solvent", "solvent"),
+        "nmr_frequency": _optional_text(raw, "nmr_frequency", "nmr_freq"),
         "nmr_frequency_nucleus": _frequency_nucleus(raw),
         "experimental_total_nH": total,
     }
+
+
+_PRESENCE_FIELDS = (
+    "candidate_smiles",
+    "c_nmr_peaks",
+    "h_nmr_peaks",
+    "nmr_solvent",
+    "nmr_frequency",
+    "nmr_frequency_nucleus",
+    "experimental_total_nH",
+)
+
+
+def describe_input_presence(rec: Mapping[str, Any]) -> Dict[str, Any]:
+    """Record raw field presence before alias resolution or normalization.
+
+    Outer structured fields, a JSON task string, and legacy Alpaca headers are
+    separate layers. The input hash does not replace these states.
+    """
+    outer = {key: value_presence(rec, key) for key in _PRESENCE_FIELDS}
+    json_layer = None
+    alpaca_layer = None
+    text = rec.get("input")
+    if isinstance(text, str) and text.strip():
+        stripped = text.strip()
+        if stripped[0] in "{[":
+            try:
+                loaded = json.loads(stripped, parse_constant=_reject_json_constant)
+            except TaskInputError:
+                raise
+            except json.JSONDecodeError as exc:
+                raise TaskInputError(f"invalid task JSON: {exc.msg} at line {exc.lineno}") from exc
+            if not isinstance(loaded, dict):
+                raise TaskInputError("task JSON must be an object")
+            json_layer = {key: value_presence(loaded, key) for key in _PRESENCE_FIELDS}
+        else:
+            alpaca_layer = _alpaca_presence(text)
+    return {
+        "outer_structured": outer,
+        "json_string": json_layer,
+        "alpaca_text": alpaca_layer,
+    }
+
+
+def _alpaca_presence(text: str) -> Dict[str, Any]:
+    found: Dict[str, Any] = {
+        "c_nmr_peaks": "missing",
+        "h_nmr_peaks": "missing",
+        "headers": [],
+    }
+    for raw_line in text.splitlines():
+        header = _HEADER_RE.match(raw_line.strip())
+        if header is None:
+            continue
+        section = header.group(1).upper()
+        frequency, solvent = _split_header_parenthetical(header.group(2))
+        body = header.group(3).strip()
+        key = "c_nmr_peaks" if section == "13C" else "h_nmr_peaks"
+        found[key] = "empty_list" if not body or body.casefold() == "n/a" else "present"
+        found["headers"].append({
+            "section": section,
+            "frequency_raw": frequency,
+            "solvent_raw": solvent,
+        })
+    return found
 
 
 def value_presence(source: Mapping[str, Any], key: str) -> str:
@@ -327,37 +493,49 @@ def _parse_explicit_float(token: str, where: str) -> float:
 
 
 def _parse_h_inner(inner: Optional[str], where: str) -> Dict[str, Any]:
+    """Split the parenthesis into whole tokens before reading J or nH.
+
+    A J number must occupy its own comma-separated token. ``12H`` is one nH
+    token, so the leading ``1`` cannot be pulled into the J list.
+    """
     if inner is None or inner.strip() == "":
         return {}
-    j_match = _J_RE.search(inner)
-    if re.search(r"J\s*=", inner, re.IGNORECASE) and j_match is None:
-        raise TaskInputError(f"unsupported J token at {where}: {inner!r}")
-    rest = inner
-    j_raw = None
-    if j_match is not None:
-        j_raw = j_match.group(1).strip()
-        rest = inner[: j_match.start()] + inner[j_match.end() :]
     kept: Dict[str, Any] = {}
     category = None
-    saw_nh = False
-    for piece in _split_top_level_commas(rest):
-        if not piece:
+    j_numbers: List[str] = []
+    expecting_j = False
+    for piece in _split_top_level_commas(inner):
+        token = piece.strip()
+        if not token:
             continue
-        nh_match = _NH_RE.fullmatch(piece.strip())
+        nh_match = _NH_RE.fullmatch(token)
         if nh_match:
-            if saw_nh:
-                raise TaskInputError(f"multiple nH values at {where}: {inner!r}")
+            if "nH" in kept:
+                raise TaskInputError(f"multiple nH values at {where}: {token!r}")
             kept["nH"] = int(nh_match.group(1))
-            saw_nh = True
+            expecting_j = False
             continue
-        if category is None:
-            category = piece.strip()
+        j_eq = _J_EQ_RE.fullmatch(token)
+        if j_eq:
+            if j_numbers:
+                raise TaskInputError(f"multiple J lists at {where}: {token!r}")
+            j_numbers.append(j_eq.group(1))
+            expecting_j = True
             continue
-        raise TaskInputError(f"unsupported token at {where}: {piece!r}")
+        if expecting_j and _J_CONT_RE.fullmatch(token):
+            j_numbers.append(token)
+            continue
+        if _CATEGORY_RE.fullmatch(token) and token.casefold() != "h":
+            if category is not None:
+                raise TaskInputError(f"multiple categories at {where}: {token!r}")
+            category = token
+            expecting_j = False
+            continue
+        raise TaskInputError(f"unsupported token at {where}: {token!r}")
     if category is not None:
         kept["category"] = category
-    if j_raw is not None:
-        kept["j_values"] = j_raw
+    if j_numbers:
+        kept["j_values"] = ", ".join(j_numbers)
     return kept
 
 
@@ -573,7 +751,11 @@ def describe_integrals(h_peaks: Optional[Iterable[Any]], explicit: Any) -> Dict[
         if value is None:
             missing += 1
             continue
-        if not _is_number(value) or (isinstance(value, float) and not math.isfinite(value)):
+        if (
+            not _is_number(value)
+            or (isinstance(value, float) and not math.isfinite(value))
+            or value < 0
+        ):
             invalid += 1
             continue
         known_values.append(value)
@@ -587,7 +769,11 @@ def describe_integrals(h_peaks: Optional[Iterable[Any]], explicit: Any) -> Dict[
     explicit_value = None
     explicit_invalid = False
     if explicit is not None:
-        if not _is_number(explicit) or (isinstance(explicit, float) and not math.isfinite(explicit)):
+        if (
+            not _is_number(explicit)
+            or (isinstance(explicit, float) and not math.isfinite(explicit))
+            or explicit < 0
+        ):
             explicit_invalid = True
         else:
             explicit_value = explicit

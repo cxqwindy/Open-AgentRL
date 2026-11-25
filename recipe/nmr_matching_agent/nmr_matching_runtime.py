@@ -32,7 +32,13 @@ from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 from scipy.optimize import linear_sum_assignment
 
-from recipe.nmr_matching_agent.task_input import describe_integrals
+from recipe.nmr_matching_agent.task_input import (
+    annotate_task_error,
+    describe_integrals,
+    normalize_task_input,
+    peak_has_signal,
+    task_sample_id,
+)
 
 try:  # silence RDKit sanitize spam
     from rdkit import RDLogger
@@ -121,10 +127,13 @@ class NmrMatchingRuntime:
         h_tolerance: int = 2,
         **_ignored: Any,
     ) -> None:
-        self.record = record or {}
-        self.candidate_smiles: str = str(self.record.get("candidate_smiles", "") or "").strip()
-        self.c_peaks: List[Dict[str, Any]] = self.record.get("c_nmr_peaks") or []
-        self.h_peaks: List[Dict[str, Any]] = self.record.get("h_nmr_peaks") or []
+        try:
+            self.record = normalize_task_input(record or {})
+        except (TypeError, ValueError) as exc:
+            raise annotate_task_error(exc, task_sample_id(record or {}), "NmrMatchingRuntime") from exc
+        self.candidate_smiles = self.record["candidate_smiles"]
+        self.c_peaks: List[Dict[str, Any]] = self.record["c_nmr_peaks"]
+        self.h_peaks: List[Dict[str, Any]] = self.record["h_nmr_peaks"]
         self.prediction_cache = prediction_cache or {}
         self.allow_remote_predict = bool(allow_remote_predict)
         self.sigma_c = float(sigma_c)
@@ -184,7 +193,7 @@ class NmrMatchingRuntime:
 
         if element == "C":
             cand_count = _count_carbons(self._mol)
-            exp_signals = len(self.c_peaks)
+            exp_signals = sum(1 for peak in self.c_peaks if peak_has_signal(peak, "C"))
             # A candidate can have MORE carbons than distinct 13C signals (symmetry /
             # accidental overlap), but it can NEVER have FEWER carbons than resolved
             # signals. candidate_count < experimental_signals is a hard contradiction.

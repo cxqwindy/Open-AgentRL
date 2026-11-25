@@ -67,7 +67,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.append(str(_REPO_ROOT))
 
 from nmr_matching_runtime import NmrMatchingRuntime  # noqa: E402
-from recipe.nmr_matching_agent.task_input import normalize_task_input, task_to_lossless_text  # noqa: E402
+from recipe.nmr_matching_agent.task_input import (  # noqa: E402
+    annotate_task_error,
+    normalize_task_input,
+    task_sample_id,
+    task_to_lossless_text,
+)
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -302,7 +307,10 @@ class RuleBasedRouter:
         config: Optional[Dict[str, Any]] = None,
         allow_remote_predict: bool = True,
     ) -> None:
-        self.record = normalize_task_input(record)
+        try:
+            self.record = normalize_task_input(record)
+        except (TypeError, ValueError) as exc:
+            raise annotate_task_error(exc, task_sample_id(record), "RuleBasedRouter") from exc
         cfg = config if config is not None else _DEFAULT_CONFIG
         # Dual-threshold: C&H both match → lower bar; only one matches → strict bar
         self.sim_threshold_both:   float = float(cfg.get("sim_threshold_both",   0.85))

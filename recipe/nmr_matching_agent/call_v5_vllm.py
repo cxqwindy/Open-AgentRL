@@ -40,10 +40,13 @@ from recipe.nmr_matching_agent.standalone_infer_matching import (  # noqa: E402
     prepare_eval_record,
 )
 from recipe.nmr_matching_agent.task_input import (  # noqa: E402
+    TaskInputError,
+    annotate_task_error,
     has_experimental_signal,
     normalize_task_input,
     parse_c_peak_list,
     parse_h_peak_list,
+    task_sample_id,
     task_to_lossless_text,
 )
 
@@ -90,16 +93,26 @@ async def chat_turn(client: httpx.AsyncClient, url: str, model: str,
     return text, raw_msg
 
 
+def _listed_peaks(case: Dict[str, Any], key: str) -> List[Any]:
+    if key not in case or case.get(key) is None:
+        return []
+    value = case.get(key)
+    if not isinstance(value, list):
+        raise TaskInputError(f"{key} must be a list, got {type(value).__name__}")
+    return value
+
+
 def user_record_from_case(case: Dict[str, Any]) -> Dict[str, Any]:
     """Project a case onto the physical task, including an explicit total integral.
 
     ``nmr_frequency_nucleus`` stays unknown unless the case itself declares one.
     The spectrum predictor's default solvent and frequency are not changed here.
+    A non-list peak field is rejected here. It is not turned into an empty list.
     """
     raw = {
         "candidate_smiles": case.get("candidate_smiles"),
-        "c_nmr_peaks": case.get("c_nmr_peaks") if isinstance(case.get("c_nmr_peaks"), list) else [],
-        "h_nmr_peaks": case.get("h_nmr_peaks") if isinstance(case.get("h_nmr_peaks"), list) else [],
+        "c_nmr_peaks": _listed_peaks(case, "c_nmr_peaks"),
+        "h_nmr_peaks": _listed_peaks(case, "h_nmr_peaks"),
         "nmr_solvent": case.get("nmr_solvent"),
         "nmr_frequency": case.get("nmr_frequency"),
     }
@@ -114,7 +127,10 @@ async def run_case(url: str, model: str, case: Dict[str, Any],
                    prediction_cache: Dict[str, Any],
                    max_turns: int = 8,
                    allow_remote_predict: bool = True) -> Dict[str, Any]:
-    record = user_record_from_case(case)
+    try:
+        record = user_record_from_case(case)
+    except (TaskInputError, TypeError, ValueError) as exc:
+        raise annotate_task_error(exc, task_sample_id(case), "vLLM run_case") from exc
     if not has_experimental_signal(record):
         raise ValueError("task has no experimental NMR peaks")
     runtime = NmrMatchingRuntime(record, prediction_cache=prediction_cache,

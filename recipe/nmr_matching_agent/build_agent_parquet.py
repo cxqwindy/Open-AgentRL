@@ -34,8 +34,8 @@ import pandas as pd
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from prompt import build_system_prompt  # noqa: E402
-from standalone_infer_matching import parse_alpaca_input, prepare_eval_record  # noqa: E402
-from task_input import has_experimental_signal, normalize_task_input, task_to_lossless_text  # noqa: E402
+from standalone_infer_matching import _pair_index_for, parse_alpaca_input, prepare_eval_record  # noqa: E402
+from task_input import task_to_lossless_text  # noqa: E402
 
 DATA_SOURCE = "nmr_matching_v4_agent"
 
@@ -79,14 +79,21 @@ def _row_from_parquet_row(row) -> dict:
     last = prompt[-1]
     user_content = last["content"] if isinstance(last, dict) else _as_dict(last)["content"]
 
-    case = _alpaca_input_to_case(user_content)
+    stripped = _INSTRUCTION_RE.sub("", user_content, count=1)
+    extra = _as_dict(row["extra_info"]) or {}
+    pair_index = extra.get("index", 0)
+    if isinstance(pair_index, bool) or not isinstance(pair_index, int) or pair_index < 0:
+        pair_index = 0
+    prepared = prepare_eval_record({"input": stripped}, pair_index)
+    case = prepared["inference_input"]
     if not case.get("candidate_smiles"):
         raise ValueError("task candidate is missing; reward ground_truth is not a candidate source")
-    case = normalize_task_input(case)
-    if not has_experimental_signal(case):
-        raise ValueError("task has no experimental NMR peaks")
     rm = _as_dict(row["reward_model"]) or {}
     gt = _as_dict(rm.get("ground_truth")) or {}
+    metadata = dict(extra)
+    metadata["pair_id"] = prepared["pair_id"]
+    metadata["run_id"] = prepared["run_id"]
+    metadata["input_sidecar"] = prepared["input_sidecar"]
 
     system_prompt = build_system_prompt()
     return {
@@ -97,7 +104,7 @@ def _row_from_parquet_row(row) -> dict:
         ],
         "ability": row.get("ability", "NMR"),
         "reward_model": {"ground_truth": gt},
-        "extra_info": _as_dict(row["extra_info"]) or {},
+        "extra_info": metadata,
     }
 
 
@@ -110,7 +117,7 @@ def _row_from_alpaca(idx: int, rec: dict) -> dict:
         raise ValueError(f"row {idx}: record is not an object")
     if not rec.get("input") and not rec.get("candidate_smiles") and not rec.get("candidate"):
         raise ValueError(f"row {idx}: task candidate is missing; _gt_smiles is not a candidate source")
-    prepared = prepare_eval_record(rec, idx)
+    prepared = prepare_eval_record(rec, _pair_index_for(rec, idx))
     case = prepared["inference_input"]
     meta_candidate = rec.get("_candidate_smiles")
     if meta_candidate and meta_candidate != case.get("candidate_smiles"):
@@ -133,7 +140,14 @@ def _row_from_alpaca(idx: int, rec: dict) -> dict:
         ],
         "ability": "NMR",
         "reward_model": {"ground_truth": gt},
-        "extra_info": {"index": idx, "label": gt["label"], "negative_type": gt["negative_type"]},
+        "extra_info": {
+            "index": idx,
+            "pair_id": prepared["pair_id"],
+            "run_id": prepared["run_id"],
+            "label": gt["label"],
+            "negative_type": gt["negative_type"],
+            "input_sidecar": prepared["input_sidecar"],
+        },
     }
 
 
