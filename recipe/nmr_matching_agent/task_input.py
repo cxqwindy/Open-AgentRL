@@ -259,24 +259,41 @@ def _validate_peak_object(peak: Mapping[str, Any], nucleus: str, where: str) -> 
             _check_j_values(peak.get("j_values"), f"{where}.j_values")
 
 
+def peak_container(raw: Mapping[str, Any], key: str) -> Tuple[str, Any]:
+    """Classify a peak field before alias fallback.
+
+    A missing key, JSON null, and a list (including ``[]``) stay distinct.
+    ``{}``, ``False``, ``0``, and ``""`` are illegal containers. They are not
+    treated as a missing spectrum.
+    """
+    if key not in raw:
+        return "missing", None
+    value = raw.get(key)
+    if value is None:
+        return "null", None
+    if isinstance(value, list):
+        return "list", value
+    raise TaskInputError(f"{key} must be a list when provided, got {type(value).__name__}")
+
+
 def _peak_list(raw: Mapping[str, Any], primary: str, alias: str, nucleus: str) -> List[Any]:
-    supplied = raw.get(primary)
-    if not supplied:
-        flat = raw.get(alias) or []
-        if not isinstance(flat, list):
-            raise TaskInputError(f"{alias} must be a list when provided")
+    primary_state, primary_value = peak_container(raw, primary)
+    alias_state, alias_value = peak_container(raw, alias)
+    # An empty list still falls through to the alias. An illegal container does not.
+    use_alias = primary_state in {"missing", "null"} or primary_value == []
+    if use_alias:
+        if alias_state != "list" or not alias_value:
+            return []
         peaks = []
-        for index, value in enumerate(flat):
+        for index, value in enumerate(alias_value):
             where = f"{alias}[{index}]"
             peak = _scalar_peak(value, nucleus, where)
             _validate_peak_object(peak, nucleus, where)
             peaks.append(peak)
         return peaks
-    if not isinstance(supplied, list):
-        raise TaskInputError(f"{primary} must be a list when provided")
     allowed = _C_PEAK_FIELD_SET if nucleus == "C" else _H_PEAK_FIELD_SET
     peaks = []
-    for index, value in enumerate(supplied):
+    for index, value in enumerate(primary_value):
         where = f"{primary}[{index}]"
         if isinstance(value, dict):
             peak = project_peaks([value], allowed)[0]
@@ -321,7 +338,9 @@ def normalize_task_input(raw: Mapping[str, Any]) -> Dict[str, Any]:
     inserted. ``nmr_frequency_nucleus`` defaults to ``unknown`` and is never
     inferred from the frequency number. Every peak that remains must carry a
     finite shift or a complete range. Empty peak objects are rejected at their
-    index instead of being dropped or counted.
+    index instead of being dropped or counted. A present peak field that is not
+    a list, including ``{}``, ``False``, ``0``, and ``""``, raises before alias
+    fallback. It is not treated as a missing spectrum.
     """
     if not isinstance(raw, Mapping):
         raise TaskInputError("task input must be a mapping")

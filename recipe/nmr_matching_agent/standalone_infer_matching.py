@@ -55,6 +55,7 @@ from recipe.nmr_matching_agent.task_input import (  # noqa: E402
     normalize_task_input,
     parse_alpaca_input,
     parse_task_text,
+    peak_container,
     project_peaks,
     task_sample_id,
     task_to_lossless_text,
@@ -556,13 +557,16 @@ def _source_sample_id(rec: Dict[str, Any]) -> Any:
 
 def _present_peaks(raw: Dict[str, Any], primary: str, alias: Optional[str], nucleus: str) -> List[Any]:
     """Return canonical peaks from one source. An empty list means 'not provided'."""
-    peaks = raw.get(primary) or None
-    if not peaks and alias:
-        peaks = raw.get(alias) or None
-    if not peaks:
+    primary_state, primary_value = peak_container(raw, primary)
+    alias_state, alias_value = ("missing", None)
+    if alias:
+        alias_state, alias_value = peak_container(raw, alias)
+    if primary_state == "list" and primary_value:
+        peaks = primary_value
+    elif alias_state == "list" and alias_value:
+        peaks = alias_value
+    else:
         return []
-    if not isinstance(peaks, list):
-        raise TypeError(f"{primary} must be a list when provided")
     if not isinstance(peaks[0], dict):
         if nucleus == "C":
             peaks = [{"delta (ppm)": float(value)} for value in peaks]

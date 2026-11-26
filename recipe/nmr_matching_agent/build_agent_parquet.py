@@ -24,6 +24,7 @@ Usage (recommended: reuse the balanced RL train set, just re-shape prompts):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sys
@@ -35,7 +36,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from prompt import build_system_prompt  # noqa: E402
 from standalone_infer_matching import _pair_index_for, parse_alpaca_input, prepare_eval_record  # noqa: E402
-from task_input import task_to_lossless_text  # noqa: E402
+from task_input import HARNESS_RUN_ID_KEY, task_to_lossless_text  # noqa: E402
 
 DATA_SOURCE = "nmr_matching_v4_agent"
 
@@ -71,8 +72,99 @@ def _as_dict(x):
         return None
 
 
+_PAIR_ID_KEYS = ("pair_id", "_harness_pair_id")
+_RUN_ID_KEYS = ("run_id", "_harness_run_id")
+
+
+def _pair_id_value(value):
+    """Return a harness pair id, or None when the value is not one.
+
+    Bool is rejected. A numpy integer survives a parquet round trip and is
+    still an integer identity, not a new id scheme.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if type(value).__module__ == "numpy" and type(value).__name__.startswith("int"):
+        return int(value)
+    return None
+
+
+def _consistent_value(extra: dict, keys, parse, noun: str):
+    present = [(key, extra[key]) for key in keys if key in extra]
+    if not present:
+        return None
+    parsed = []
+    for key, value in present:
+        got = parse(value)
+        if got is None:
+            raise ValueError(f"invalid {key}: {value!r}")
+        parsed.append((key, got))
+    if len({item[1] for item in parsed}) > 1:
+        detail = ", ".join(f"{key}={value!r}" for key, value in parsed)
+        raise ValueError(f"conflicting harness {noun}: {detail}")
+    return parsed[0][1]
+
+
+def _parse_pair_id(value):
+    got = _pair_id_value(value)
+    if got is None or got < 0:
+        return None
+    return got
+
+
+def _source_identity(extra: dict):
+    """Read harness identity without turning a missing id into 0 or null."""
+    pair_id = _consistent_value(
+        extra,
+        _PAIR_ID_KEYS,
+        _parse_pair_id,
+        "pair ids",
+    )
+    run_id = _consistent_value(
+        extra,
+        _RUN_ID_KEYS,
+        lambda value: value if isinstance(value, str) and value else None,
+        "run ids",
+    )
+    if pair_id is None and run_id is None:
+        return None, None, "unverified"
+    if pair_id is None or run_id is None:
+        return pair_id, run_id, "incomplete"
+    return pair_id, run_id, "verified"
+
+
+def _json_object(value, where: str) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{where} is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be an object, got {type(value).__name__}")
+    return value
+
+
+def _layer_sidecar(existing, conversion) -> dict:
+    """Keep original headers and conflicts. The new parse is a separate layer."""
+    existing = _json_object(existing, "input_sidecar")
+    if "source" in existing and "conversion" in existing and "headers" not in existing:
+        source = existing["source"]
+        if not isinstance(source, dict):
+            source = _json_object(source, "input_sidecar.source")
+    else:
+        source = existing
+    return {"source": copy.deepcopy(source), "conversion": conversion}
+
+
 def _row_from_parquet_row(row) -> dict:
-    """Convert a single-turn matching parquet row into an agent-shape row."""
+    """Convert a single-turn matching parquet row into an agent-shape row.
+
+    An existing harness pair id and run id are kept. A local ``index`` is
+    metadata, not a global id. The integer passed to ``prepare_eval_record``
+    is only the call argument and is not written back as a verified identity.
+    """
     prompt = _as_list(row["prompt"])
     if not prompt:
         raise ValueError(f"empty prompt in row: {row}")
@@ -81,19 +173,33 @@ def _row_from_parquet_row(row) -> dict:
 
     stripped = _INSTRUCTION_RE.sub("", user_content, count=1)
     extra = _as_dict(row["extra_info"]) or {}
-    pair_index = extra.get("index", 0)
-    if isinstance(pair_index, bool) or not isinstance(pair_index, int) or pair_index < 0:
-        pair_index = 0
-    prepared = prepare_eval_record({"input": stripped}, pair_index)
+    if not isinstance(extra, dict):
+        raise ValueError("extra_info must be an object when provided")
+    pair_id, run_id, identity_status = _source_identity(extra)
+    # prepare_eval_record requires an integer. 0 here is not a global id.
+    call_record = {"input": stripped}
+    if run_id is not None:
+        call_record[HARNESS_RUN_ID_KEY] = run_id
+    prepared = prepare_eval_record(call_record, 0 if pair_id is None else pair_id)
     case = prepared["inference_input"]
     if not case.get("candidate_smiles"):
         raise ValueError("task candidate is missing; reward ground_truth is not a candidate source")
     rm = _as_dict(row["reward_model"]) or {}
     gt = _as_dict(rm.get("ground_truth")) or {}
-    metadata = dict(extra)
-    metadata["pair_id"] = prepared["pair_id"]
-    metadata["run_id"] = prepared["run_id"]
-    metadata["input_sidecar"] = prepared["input_sidecar"]
+    metadata = copy.deepcopy(extra)
+    metadata["identity_status"] = identity_status
+    for key in _PAIR_ID_KEYS:
+        metadata.pop(key, None)
+    for key in _RUN_ID_KEYS:
+        metadata.pop(key, None)
+    if pair_id is not None:
+        metadata["pair_id"] = pair_id
+    if run_id is not None:
+        metadata["run_id"] = run_id
+    if "input_sidecar" in extra and extra.get("input_sidecar") not in (None, ""):
+        metadata["input_sidecar"] = _layer_sidecar(extra["input_sidecar"], prepared["input_sidecar"])
+    else:
+        metadata["input_sidecar"] = prepared["input_sidecar"]
 
     system_prompt = build_system_prompt()
     return {
